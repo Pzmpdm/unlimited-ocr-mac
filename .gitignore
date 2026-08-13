@@ -10,6 +10,7 @@ dist/
 
 # Virtual env
 .venv/
+.venv-*/
 venv/
 env/
 
@@ -26,6 +27,7 @@ model_dir_patched/
 *.log
 /tmp_ocr/
 /test_output/
+test-output/
 mcp_output/
 
 # macOS

@@ -9,10 +9,12 @@
 
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WEB_DIR="$REPO_DIR/web"
-VENV_DIR="${VENV_DIR:-$REPO_DIR/.venv-ocr}"
+VENV_DIR="${VENV_DIR:-$REPO_DIR/.venv-mlx}"
 PORT="${1:-8800}"
+export OCR_BACKEND=mlx
+export PORT
 
 # Colors
 GREEN='\033[0;32m'
@@ -31,7 +33,7 @@ source "$VENV_DIR/bin/activate"
 cd "$WEB_DIR"
 
 echo ""
-echo -e "${GREEN}  🚀 Starting Unlimited OCR Web UI on port ${PORT}...${NC}"
+echo -e "${GREEN}  🚀 Starting Unlimited OCR Web UI (MLX) on port ${PORT}...${NC}"
 echo -e "  ${CYAN}http://localhost:${PORT}${NC}"
 echo ""
 echo "  Press Ctrl+C to stop."

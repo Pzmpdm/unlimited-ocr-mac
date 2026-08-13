@@ -3,72 +3,167 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>OCR 扫描器</title>
-  <link rel="stylesheet" href="/static/style.css?v=6">
+  <meta name="color-scheme" content="light dark">
+  <title>Unlimited OCR · 文档工作台</title>
+  <link rel="stylesheet" href="/static/style.css?v=36">
 </head>
 <body>
-  <!-- Toolbar -->
-  <header id="toolbar">
-    <div class="toolbar-left">
-      <h1 class="logo">📄 OCR Scanner</h1>
-      <label class="btn upload-btn" for="file-input">📁 上传文件</label>
-      <input type="file" id="file-input" accept=".pdf,.png,.jpg,.jpeg,.webp,.bmp" multiple hidden>
-      <button id="scan-btn" class="btn primary" disabled>🚀 开始扫描</button>
-    </div>
-    <div class="toolbar-center">
-      <button id="prev-page" class="btn icon" disabled>◀</button>
-      <span id="page-indicator">-</span>
-      <button id="next-page" class="btn icon" disabled>▶</button>
-    </div>
-    <div class="toolbar-right">
-      <select id="translate-lang">
-        <option value="">不翻译</option>
-        <option value="zh-CN">→ 简体中文</option>
-        <option value="zh-TW">→ 繁體中文</option>
-        <option value="en">→ English</option>
-        <option value="ja">→ 日本語</option>
-        <option value="ko">→ 한국어</option>
-        <option value="fr">→ Français</option>
-        <option value="de">→ Deutsch</option>
-      </select>
-      <button id="translate-btn" class="btn" disabled>🌐 翻译</button>
-      <button id="export-btn" class="btn success" disabled>📥 导出 Word</button>
-    </div>
-  </header>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M7 3h7l4 4v14H7z"/><path d="M14 3v5h5M10 12h5M10 16h5"/></svg>
+        </div>
+        <div>
+          <h1>Unlimited OCR</h1>
+          <p>本地文档解析工作台</p>
+        </div>
+      </div>
 
-  <!-- Progress bar -->
-  <div id="progress-bar" class="hidden">
-    <div id="progress-fill"></div>
-    <span id="progress-text">准备中...</span>
+      <div class="top-actions">
+        <div id="model-pill" class="model-pill loading">
+          <span class="status-dot"></span>
+          <span id="model-info">正在连接模型</span>
+        </div>
+        <button id="theme-btn" class="icon-btn" type="button" title="切换深色模式" aria-label="切换深色模式">
+          <svg class="sun-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41"/></svg>
+        </button>
+        <button id="scan-btn" class="btn primary scan-action" disabled>
+          <svg viewBox="0 0 24 24"><path d="M4 7V4h3M17 4h3v3M20 17v3h-3M7 20H4v-3M8 12h8"/></svg>
+          <span>开始识别</span>
+        </button>
+        <div class="export-menu">
+          <button id="export-menu-btn" class="btn secondary" type="button" disabled aria-haspopup="menu" aria-expanded="false">
+            <svg viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M5 20h14"/></svg>
+            <span>导出为</span><span class="menu-chevron">⌄</span>
+          </button>
+          <div id="export-menu" class="export-menu-list" role="menu">
+            <button id="export-md-option" type="button" role="menuitem">Markdown <small>默认</small></button>
+            <button id="export-word-option" type="button" role="menuitem">Word</button>
+          </div>
+        </div>
+        <button id="follow-btn" class="btn secondary follow-btn" type="button" aria-pressed="false" title="开启后自动跟随 OCR 当前识别页">
+          <svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 0 1 14-5M20 12a8 8 0 0 1-14 5M18 4v4h-4M6 20v-4h4"/></svg>
+          <span>开启跟随</span>
+        </button>
+      </div>
+    </header>
+
+    <div id="progress-bar" class="progress-panel hidden">
+      <div class="progress-copy">
+        <span class="spinner"></span>
+        <div><strong id="progress-text">正在准备</strong><small id="progress-detail">首次识别需要加载模型</small></div>
+      </div>
+      <div class="progress-track"><div id="progress-fill"></div></div>
+      <div class="scan-controls">
+        <span id="elapsed-time">00:00</span>
+        <button id="pause-btn" class="mini-btn text" type="button">暂停</button>
+        <button id="stop-btn" class="mini-btn text danger" type="button">停止</button>
+      </div>
+    </div>
+
+    <main id="split-container" class="workspace">
+      <aside class="sidebar">
+        <label class="new-file-btn" for="file-input">
+          <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+          <span>打开文档</span>
+        </label>
+        <input type="file" id="file-input" accept=".pdf,.png,.jpg,.jpeg,.webp,.bmp" hidden>
+
+        <section id="file-card" class="file-card hidden">
+          <div class="file-icon"><svg viewBox="0 0 24 24"><path d="M7 3h7l4 4v14H7zM14 3v5h5"/></svg></div>
+          <div class="file-meta"><strong id="file-name">未选择文件</strong><span id="file-details">—</span></div>
+        </section>
+
+        <div class="sidebar-heading"><span>页面</span><span id="page-count">0</span></div>
+        <div id="page-list" class="page-list">
+          <div class="sidebar-empty">上传文档后<br>页面会显示在这里</div>
+        </div>
+
+        <div class="sidebar-footer">
+          <span class="privacy-badge"><svg viewBox="0 0 24 24"><path d="M12 3l7 3v5c0 5-3 8-7 10-4-2-7-5-7-10V6zM9 12l2 2 4-4"/></svg>本机处理，不上传云端</span>
+        </div>
+      </aside>
+
+      <section id="left-panel" class="panel source-panel">
+        <div class="panel-toolbar">
+          <div><span class="panel-kicker">原始文档</span><strong id="source-title">预览</strong></div>
+          <div class="panel-controls">
+            <button id="zoom-out" class="mini-btn" disabled aria-label="缩小">−</button>
+            <span id="zoom-level">100%</span>
+            <button id="zoom-in" class="mini-btn" disabled aria-label="放大">＋</button>
+            <button id="fit-btn" class="mini-btn text" disabled>适应</button>
+          </div>
+        </div>
+        <div id="source-view" class="source-view">
+          <img id="source-image" alt="文档页面预览">
+          <div id="source-placeholder" class="empty-state">
+            <div class="empty-illustration">
+              <svg viewBox="0 0 96 96"><rect x="20" y="12" width="56" height="72" rx="8"/><path d="M32 33h32M32 45h25M32 57h29"/><path d="M68 72l10 10M72 68a10 10 0 1 0 0 20 10 10 0 0 0 0-20z"/></svg>
+            </div>
+            <h2>把文档拖到这里</h2>
+            <p>支持 PDF、PNG、JPG、WebP 和 BMP</p>
+            <label class="btn primary" for="file-input">选择文件</label>
+          </div>
+          <div id="drop-overlay" class="drop-overlay"><strong>松开即可打开文档</strong></div>
+        </div>
+      </section>
+
+      <div id="divider" class="divider" role="separator" aria-label="调整面板宽度"></div>
+
+      <section id="right-panel" class="panel result-panel">
+        <div class="panel-toolbar">
+          <div><span class="panel-kicker">识别结果</span><strong id="result-title">实时 Markdown</strong></div>
+          <div class="panel-controls result-actions">
+            <div class="view-switch" aria-label="结果显示方式">
+              <button id="markdown-view-btn" class="active" type="button">预览</button>
+              <button id="text-view-btn" type="button">编辑</button>
+            </div>
+            <select id="translate-lang" title="翻译语言">
+              <option value="">翻译为…</option>
+              <option value="zh-CN">简体中文</option><option value="zh-TW">繁體中文</option>
+              <option value="en">English</option><option value="ja">日本語</option>
+              <option value="ko">한국어</option><option value="fr">Français</option><option value="de">Deutsch</option>
+            </select>
+            <button id="translate-btn" class="mini-btn text" disabled>翻译</button>
+            <button id="copy-btn" class="mini-btn text" disabled>
+              <svg viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></svg>复制
+            </button>
+          </div>
+        </div>
+        <div id="ocr-content" class="ocr-content">
+          <div class="result-empty">
+            <div class="result-empty-icon"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h10M4 18h13"/></svg></div>
+            <h2>识别结果将在这里呈现</h2>
+            <p>上传文档并点击「开始识别」</p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer id="status-bar" class="statusbar">
+      <span id="status-text">准备就绪</span>
+      <div class="page-nav">
+        <button id="prev-page" class="page-btn" disabled aria-label="上一页">‹</button>
+        <span id="page-indicator">— / —</span>
+        <button id="next-page" class="page-btn" disabled aria-label="下一页">›</button>
+      </div>
+      <span class="shortcut-hint">方向键切换页面</span>
+    </footer>
   </div>
 
-  <!-- Split panels -->
-  <main id="split-container">
-    <div id="left-panel">
-      <div class="panel-header">源文件</div>
-      <div id="source-view">
-        <img id="source-image" alt="Source page">
-        <p id="source-placeholder" class="placeholder">上传 PDF 或图片开始</p>
-      </div>
-    </div>
-    <div id="divider"></div>
-    <div id="right-panel">
-      <div class="panel-header">识别结果 <span id="edit-hint" class="hint">（点击文字可编辑）</span></div>
-      <div id="ocr-content">
-        <p class="placeholder">扫描结果将显示在这里</p>
-      </div>
-    </div>
-  </main>
-
-  <!-- Status bar -->
-  <footer id="status-bar">
-    <span id="status-text">就绪</span>
-    <span id="model-info"></span>
-  </footer>
-
-  <!-- Toast -->
-  <div id="toast" class="hidden"></div>
-
-  <script src="/static/app.js?v=6"></script>
+  <div id="toast" class="toast hidden"></div>
+  <script src="/static/vendor/marked.umd.js"></script>
+  <script src="/static/vendor/purify.min.js"></script>
+  <script src="/static/vendor/mermaid.min.js"></script>
+  <script>
+    window.MathJax = {
+      tex: { inlineMath: [['$', '$'], ['\\(', '\\)']], displayMath: [['$$', '$$'], ['\\[', '\\]']] },
+      svg: { fontCache: 'local' },
+      startup: { typeset: false }
+    };
+  </script>
+  <script src="/static/vendor/tex-svg.js"></script>
+  <script src="/static/app.js?v=36"></script>
 </body>
 </html>

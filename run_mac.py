@@ -82,7 +82,9 @@ def apply_patches(target_device: torch.device) -> Path:
             return patched_dir
         shutil.rmtree(patched_dir)
 
-    shutil.copytree(MODEL_DIR, patched_dir)
+    # Preserve the large model-weight symlink so patching does not duplicate
+    # another ~6.7 GB on disk.
+    shutil.copytree(MODEL_DIR, patched_dir, symlinks=True)
     device_str = str(target_device)  # 'mps' or 'cpu'
     autocast_device = device_str  # for any leftover autocast calls
 

@@ -579,7 +579,17 @@ class UnlimitedOCRModel(DeepseekV2Model):
                     images_in_this_batch = torch.cat(images_in_this_batch, dim=0)
                     # exit()
 
-                    inputs_embeds[idx].masked_scatter_(images_seq_mask[idx].unsqueeze(-1).cuda(), images_in_this_batch)
+                    # MPS needs an explicitly expanded contiguous mask here;
+                    # broadcasting the (seq, 1) mask can scatter image features
+                    # into the wrong token positions and produce empty output.
+                    image_mask = (
+                        images_seq_mask[idx]
+                        .unsqueeze(-1)
+                        .cuda()
+                        .expand_as(inputs_embeds[idx])
+                        .contiguous()
+                    )
+                    inputs_embeds[idx].masked_scatter_(image_mask, images_in_this_batch)
 
                 idx += 1
             

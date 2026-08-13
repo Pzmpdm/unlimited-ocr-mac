@@ -3,8 +3,8 @@ import os
 from pathlib import Path
 
 # Paths
-OCR_REPO_DIR = Path("~/unlimited-ocr-mac").expanduser().resolve()
 PROJECT_DIR = Path(__file__).parent.resolve()
+OCR_REPO_DIR = PROJECT_DIR.parent
 UPLOAD_DIR = PROJECT_DIR / "uploads"
 PUBLIC_DIR = PROJECT_DIR / "public"
 
@@ -13,7 +13,7 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 
 # Server
 HOST = "0.0.0.0"
-PORT = 8800
+PORT = int(os.environ.get("PORT", "8800"))
 
 # OCR defaults
 DEFAULT_MAX_LENGTH = 8192

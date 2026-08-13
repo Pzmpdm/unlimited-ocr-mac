@@ -26,12 +26,13 @@ def ensure_model():
         if _model is not None:
             return _model, _tokenizer, _device
 
+        started_at = time.time()
         from run_mac import pick_device, apply_patches, load_model
 
         _device = pick_device()
         patched_dir = apply_patches(_device)
         _model, _tokenizer = load_model(patched_dir, _device)
-        _load_time = time.time()
+        _load_time = time.time() - started_at
         print(f"[ocr_engine] model loaded on {_device} in {_load_time:.1f}s")
 
     return _model, _tokenizer, _device

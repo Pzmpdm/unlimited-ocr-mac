@@ -1,5 +1,6 @@
 """Parse OCR raw output into structured detections and HTML."""
 import re
+from urllib.parse import quote
 from typing import Optional
 
 
@@ -163,6 +164,32 @@ def generate_html(detections: list[dict], page_num: int = 1) -> str:
 
 def _escape_html(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def raw_to_markdown(raw: str, session_id: str = "", page_num: int = 1) -> str:
+    """Remove grounding metadata while preserving model-produced Markdown."""
+    if not raw:
+        return ""
+
+    pattern = re.compile(r"<\|det\|>(\w+)\s*\[([^\]]*)\]<\|/det\|>")
+
+    def replace_detection(match: re.Match) -> str:
+        det_type = match.group(1).lower()
+        coords = ",".join(x.strip() for x in match.group(2).split(","))
+        if det_type in {"image", "figure", "chart", "diagram"} and session_id:
+            url = f"/api/region-image/{quote(session_id)}/{page_num}/{quote(coords)}"
+            return f"\n\n![图表或图片区域]({url})\n\n"
+        if det_type == "title":
+            return "\n\n## "
+        if det_type in {"table", "formula"}:
+            return "\n\n"
+        return ""
+
+    markdown = pattern.sub(replace_detection, raw)
+    markdown = re.sub(r"<\|/?(?:ref|grounding)\|>", "", markdown)
+    markdown = markdown.replace("<｜end▁of▁sentence｜>", "")
+    markdown = re.sub(r"^(#{1,6})\s+(#{1,6})\s+", r"\2 ", markdown, flags=re.MULTILINE)
+    return markdown.strip()
 
 
 def generate_det_html(det: dict, index: int) -> str:

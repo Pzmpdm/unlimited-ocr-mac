@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WEB_DIR="$REPO_DIR/web"
 VENV_DIR="${VENV_DIR:-$REPO_DIR/.venv-ocr}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"

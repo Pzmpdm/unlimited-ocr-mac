@@ -6,6 +6,7 @@ import os
 import shutil
 import time
 import uuid
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -24,7 +25,10 @@ from fastapi import FastAPI, UploadFile, File, Form, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-import ocr_engine
+if os.environ.get("OCR_BACKEND", "mlx").lower() == "pytorch":
+    import ocr_engine
+else:
+    import ocr_engine_mlx as ocr_engine
 import pdf_converter
 import ocr_parser
 import translator
@@ -48,6 +52,15 @@ class SessionData:
 
 
 sessions: dict[str, SessionData] = {}
+
+
+class ScanControl:
+    def __init__(self):
+        self.paused = threading.Event()
+        self.cancelled = threading.Event()
+
+
+scan_controls: dict[str, ScanControl] = {}
 
 
 # ── App lifespan ───────────────────────────────────────────────
@@ -117,7 +130,7 @@ async def upload(file: UploadFile = File(...)):
 
 @app.post("/api/scan")
 async def scan(request: Request):
-    """SSE endpoint: scan pages, push each detection line in real-time."""
+    """SSE endpoint: stream generated tokens, then structured page results."""
     body = await request.json()
     session_id = body.get("session_id")
     max_length = body.get("max_length", 8192)
@@ -125,60 +138,121 @@ async def scan(request: Request):
     session = sessions.get(session_id)
     if not session:
         return JSONResponse({"error": "Session not found"}, status_code=404)
+    control = ScanControl()
+    scan_controls[session_id] = control
 
     async def event_generator():
-        for page_num in range(1, session.total_pages + 1):
-            yield _sse("page_start", {"page_num": page_num, "total_pages": session.total_pages})
-            yield _sse("page_progress", {"page_num": page_num, "status": "scanning"})
+        stopped = False
+        try:
+            for page_num in range(1, session.total_pages + 1):
+                if control.cancelled.is_set():
+                    stopped = True
+                    break
+                yield _sse("page_start", {"page_num": page_num, "total_pages": session.total_pages})
+                yield _sse("page_progress", {"page_num": page_num, "status": "scanning"})
 
-            img_path = str(session.page_images[page_num - 1])
+                img_path = str(session.page_images[page_num - 1])
 
-            try:
-                raw = await asyncio.to_thread(ocr_engine.ocr_page, img_path, max_length)
-            except Exception as e:
-                yield _sse("error", {"page_num": page_num, "message": str(e)})
-                continue
+                try:
+                    if hasattr(ocr_engine, "ocr_page_stream"):
+                        stream = ocr_engine.ocr_page_stream(img_path, max_length)
+                        raw = ""
+                        while True:
+                            while control.paused.is_set() and not control.cancelled.is_set():
+                                await asyncio.sleep(0.08)
+                            if control.cancelled.is_set():
+                                stream.close()
+                                stopped = True
+                                break
+                            done, item = await asyncio.to_thread(_next_stream_item, stream)
+                            if done:
+                                break
+                            raw = item["text"]
+                            yield _sse("token", {
+                                "page_num": page_num,
+                                "text": raw,
+                                "markdown": ocr_parser.raw_to_markdown(raw, session_id, page_num),
+                                "tokens": item.get("tokens", 0),
+                                "done": item.get("done", False),
+                                "stats": item.get("stats"),
+                            })
+                    else:
+                        raw = await asyncio.to_thread(ocr_engine.ocr_page, img_path, max_length)
+                except Exception as e:
+                    if control.cancelled.is_set():
+                        stopped = True
+                        break
+                    yield _sse("error", {"page_num": page_num, "message": str(e)})
+                    continue
 
-            yield _sse("page_progress", {"page_num": page_num, "status": "parsing"})
+                if stopped:
+                    break
 
-            detections = ocr_parser.parse_ocr_output(raw)
-            blocks = ocr_parser.reconstruct_structure(detections)
+                yield _sse("page_progress", {"page_num": page_num, "status": "parsing"})
+
+                detections = ocr_parser.parse_ocr_output(raw)
+                blocks = ocr_parser.reconstruct_structure(detections)
 
             # Store full results
-            html = ocr_parser.generate_html(detections, page_num)
-            session.page_results[page_num] = {
-                "detections": detections, "html": html, "raw": raw, "blocks": blocks,
-            }
+                html = ocr_parser.generate_html(detections, page_num)
+                markdown = ocr_parser.raw_to_markdown(raw, session_id, page_num)
+                session.page_results[page_num] = {
+                    "detections": detections, "html": html, "raw": raw,
+                    "markdown": markdown, "blocks": blocks,
+                }
 
             # Push each detection line one by one for real-time display
-            for i, det in enumerate(detections):
-                det_html = ocr_parser.generate_det_html(det, i)
-                yield _sse("det_result", {
-                    "page_num": page_num,
-                    "det_index": i,
-                    "detection": det,
-                    "html": det_html,
-                    "total_detections": len(detections),
-                })
+                for i, det in enumerate(detections):
+                    det_html = ocr_parser.generate_det_html(det, i)
+                    yield _sse("det_result", {
+                        "page_num": page_num, "det_index": i,
+                        "detection": det, "html": det_html,
+                        "total_detections": len(detections),
+                    })
 
-            yield _sse("page_done", {"page_num": page_num, "html": html})
-            yield _sse("page_image", {"page_num": page_num, "image_url": f"/api/page-image/{session_id}/{page_num}"})
+                yield _sse("page_done", {"page_num": page_num, "html": html, "markdown": markdown})
+                yield _sse("page_image", {"page_num": page_num, "image_url": f"/api/page-image/{session_id}/{page_num}"})
 
-            try:
-                import torch
-                if hasattr(torch, "mps") and torch.backends.mps.is_available():
-                    torch.mps.empty_cache()
-            except Exception:
-                pass
-
-        yield _sse("scan_complete", {"session_id": session_id, "total_pages": session.total_pages})
+            yield _sse("scan_stopped" if stopped else "scan_complete", {
+                "session_id": session_id, "total_pages": session.total_pages
+            })
+        finally:
+            scan_controls.pop(session_id, None)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@app.post("/api/scan-control")
+async def scan_control(request: Request):
+    body = await request.json()
+    control = scan_controls.get(body.get("session_id"))
+    if not control:
+        return {"ok": False, "state": "idle"}
+    action = body.get("action")
+    if action == "pause":
+        control.paused.set()
+        return {"ok": True, "state": "paused"}
+    if action == "resume":
+        control.paused.clear()
+        return {"ok": True, "state": "running"}
+    if action == "stop":
+        control.cancelled.set()
+        control.paused.clear()
+        return {"ok": True, "state": "stopping"}
+    return JSONResponse({"error": "Unknown action"}, status_code=400)
 
 
 def _sse(event: str, data: dict) -> str:
     """Format a single SSE event for immediate flush."""
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _next_stream_item(iterator):
+    """Bridge a blocking Python generator into asyncio without leaking StopIteration."""
+    try:
+        return False, next(iterator)
+    except StopIteration:
+        return True, None
 
 
 @app.get("/api/page-image/{session_id}/{page_num}")
@@ -188,6 +262,37 @@ async def page_image(session_id: str, page_num: int):
         return JSONResponse({"error": "Not found"}, status_code=404)
     img_path = session.page_images[page_num - 1]
     return FileResponse(str(img_path), media_type="image/png")
+
+
+@app.get("/api/region-image/{session_id}/{page_num}/{coords}")
+async def region_image(session_id: str, page_num: int, coords: str):
+    """Crop a normalized 0..1000 OCR bounding box for figures and charts."""
+    session = sessions.get(session_id)
+    if not session or page_num < 1 or page_num > session.total_pages:
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    try:
+        box = [int(v) for v in coords.split(",")]
+        if len(box) != 4:
+            raise ValueError
+    except ValueError:
+        return JSONResponse({"error": "Invalid region"}, status_code=400)
+
+    from PIL import Image
+
+    image_path = session.page_images[page_num - 1]
+    region_dir = session.upload_dir / "regions"
+    region_dir.mkdir(exist_ok=True)
+    output = region_dir / f"p{page_num}_{'_'.join(map(str, box))}.png"
+    if not output.exists():
+        with Image.open(image_path) as image:
+            width, height = image.size
+            x1, y1, x2, y2 = box
+            pixel_box = (
+                max(0, int(x1 / 1000 * width)), max(0, int(y1 / 1000 * height)),
+                min(width, int(x2 / 1000 * width)), min(height, int(y2 / 1000 * height)),
+            )
+            image.crop(pixel_box).save(output, "PNG")
+    return FileResponse(output, media_type="image/png")
 
 
 @app.put("/api/edit")
@@ -272,6 +377,25 @@ async def export_docx(request: Request):
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         filename=output_path.name,
     )
+
+
+@app.post("/api/export-markdown")
+async def export_markdown(request: Request):
+    body = await request.json()
+    session = sessions.get(body.get("session_id"))
+    if not session:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+
+    pages = []
+    for page_num in sorted(session.page_results):
+        markdown = session.page_results[page_num].get("markdown", "").strip()
+        if session.total_pages > 1:
+            pages.append(f"<!-- 第 {page_num} 页 -->\n\n{markdown}")
+        else:
+            pages.append(markdown)
+    output_path = session.upload_dir / f"{Path(session.source_name).stem}_ocr.md"
+    output_path.write_text("\n\n---\n\n".join(pages) + "\n", encoding="utf-8")
+    return FileResponse(output_path, media_type="text/markdown; charset=utf-8", filename=output_path.name)
 
 
 # ── Run ────────────────────────────────────────────────────────
