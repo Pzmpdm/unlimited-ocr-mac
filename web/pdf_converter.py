@@ -586,6 +586,22 @@ def _is_genuine_table(table) -> bool:
     return len(multi_col_rows) >= 2
 
 
+_BIT_PATTERN_CHARS = set("01XSPRWACK…")
+
+
+def _is_bit_pattern_table(table) -> bool:
+    """I²C/SPI timing diagrams read as rows of 0/1/X/S/P bits; those are not
+    real tables even though find_tables may report them as such."""
+    bit_rows = 0
+    for row in table.extract():
+        joined = "".join(cell for cell in row if cell and cell.strip())
+        if joined and all(
+            ch in _BIT_PATTERN_CHARS or ch.isspace() for ch in joined
+        ):
+            bit_rows += 1
+    return bit_rows >= 2
+
+
 def _extract_tables(page, skip_boxes: list[tuple] | None = None,
                     found: list | None = None) -> list[dict]:
     tables = []
@@ -614,6 +630,8 @@ def _extract_tables(page, skip_boxes: list[tuple] | None = None,
             and other.bbox[3] - other.bbox[1] >= 25
             for other in found
         ):
+            continue
+        if _is_bit_pattern_table(table):
             continue
         # find_tables occasionally mistakes charts and schematics for tables;
         # those regions are already captured as figures, so skip them here.
@@ -1016,6 +1034,11 @@ def _figure_regions(lines: list[dict], page, found_tables: list | None = None) -
                     # introductory prose from the drawing.
                     top = max(top, max(gaps)[1])
                 top = min(top, y0 - 200.0)
+                # Closely spaced diagram rows (I²C/SPI bit streams) look like
+                # large internal whitespace gaps; never let the refinement cut
+                # the topmost graphic out of the crop.
+                if above:
+                    top = min(top, min(above) - 8.0)
                 top = max(84.0, previous_caption_bottom + 10.0, top)
                 near_images = [
                     image_top for image_top, image_height in image_tops
