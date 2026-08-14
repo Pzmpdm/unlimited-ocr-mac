@@ -65,9 +65,13 @@ def export_docx(pages: list[dict], output_path: Path, export_mode: str = "origin
 
             elif det_type == "image":
                 p = doc.add_paragraph()
-                run = p.add_run("[图片]")
-                run.font.color.rgb = RGBColor(128, 128, 128)
-                run.font.italic = True
+                image_path = det.get("image_path")
+                if image_path and Path(image_path).exists():
+                    p.add_run().add_picture(image_path, width=Pt(420))
+                else:
+                    run = p.add_run("[图片]")
+                    run.font.color.rgb = RGBColor(128, 128, 128)
+                    run.font.italic = True
 
             elif det_type == "page_number":
                 p = doc.add_paragraph()

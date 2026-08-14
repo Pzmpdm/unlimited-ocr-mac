@@ -2,14 +2,18 @@
 from __future__ import annotations
 import asyncio
 import json
+import re
 import os
 import shutil
 import time
 import uuid
 import threading
+import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
+
+import pymupdf as fitz
 
 # Load .env file before importing config
 _dotenv = Path(__file__).parent / ".env"
@@ -33,6 +37,7 @@ import pdf_converter
 import ocr_parser
 import translator
 import docx_exporter
+from urllib.parse import unquote
 from config import PUBLIC_DIR, UPLOAD_DIR, PORT, HOST
 
 
@@ -40,15 +45,22 @@ from config import PUBLIC_DIR, UPLOAD_DIR, PORT, HOST
 
 class SessionData:
     def __init__(self, session_id: str, upload_dir: Path, source_name: str,
-                 total_pages: int, page_images: list[Path]):
+                 total_pages: int, page_images: list[Path],
+                 native_page_texts: Optional[list[str]] = None,
+                 native_pages: Optional[list[dict]] = None):
         self.session_id = session_id
         self.upload_dir = upload_dir
         self.source_name = source_name
         self.total_pages = total_pages
         self.page_images = page_images
+        self.native_page_texts = native_page_texts or [""] * total_pages
+        self.native_pages = native_pages or [{} for _ in range(total_pages)]
         self.page_results: dict[int, dict] = {}  # page_num → {detections, html, raw, blocks}
         self.page_translations: dict[int, list] = {}
         self.created_at = time.time()
+        self.processing = False
+        self.processed_pages = 0
+        self.processing_error: Optional[str] = None
 
 
 sessions: dict[str, SessionData] = {}
@@ -110,21 +122,68 @@ async def upload(file: UploadFile = File(...)):
     ext = Path(file.filename).suffix.lower()
 
     if ext == ".pdf":
-        # Convert PDF to PNGs
-        page_images = pdf_converter.pdf_to_images(str(src_path), session_dir)
+        # PDFs with many pages take a while to render and parse. Return
+        # immediately and let the front-end poll /api/upload-progress.
+        total_pages = pdf_converter.page_count(str(src_path))
+        session = SessionData(session_id, session_dir, source_name, total_pages, [], [], [])
+        session.processing = True
+        sessions[session_id] = session
+        asyncio.create_task(asyncio.to_thread(_process_pdf_sync, session, str(src_path)))
     elif ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
-        page_images = [src_path]
+        total_pages = 1
+        session = SessionData(session_id, session_dir, source_name, total_pages, [src_path], [], [])
+        sessions[session_id] = session
     else:
         shutil.rmtree(session_dir, ignore_errors=True)
         return JSONResponse({"error": f"Unsupported file type: {ext}"}, status_code=400)
-
-    total_pages = len(page_images)
-    sessions[session_id] = SessionData(session_id, session_dir, source_name, total_pages, page_images)
 
     return {
         "session_id": session_id,
         "total_pages": total_pages,
         "source_name": source_name,
+        "processing": session.processing,
+    }
+
+
+def _process_pdf_sync(session: SessionData, src_path: str) -> None:
+    """Render pages and extract native layout, updating progress per page."""
+    try:
+        doc = fitz.open(src_path)
+        try:
+            images: list[Path] = []
+            native_pages: list[dict] = []
+            for page_num in range(1, len(doc) + 1):
+                out_path = session.upload_dir / f"page_{page_num:04d}.png"
+                pdf_converter.render_page_image(doc, page_num - 1, out_path)
+                images.append(out_path)
+                native_pages.append(
+                    pdf_converter.extract_native_page(doc, page_num, session.session_id)
+                )
+                session.processed_pages = page_num
+            session.page_images = images
+            session.native_pages = native_pages
+            session.native_page_texts = [page.get("text", "") for page in native_pages]
+            session.total_pages = len(images)
+            session.processing_error = None
+        finally:
+            doc.close()
+    except Exception as exc:  # noqa: BLE001
+        session.processing_error = str(exc)
+    finally:
+        session.processing = False
+
+
+@app.get("/api/upload-progress/{session_id}")
+async def upload_progress(session_id: str):
+    """Report how many pages have been rendered/parsed for an upload."""
+    session = sessions.get(session_id)
+    if not session:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    return {
+        "processing": session.processing,
+        "processed_pages": session.processed_pages,
+        "total_pages": session.total_pages,
+        "error": session.processing_error,
     }
 
 
@@ -138,6 +197,10 @@ async def scan(request: Request):
     session = sessions.get(session_id)
     if not session:
         return JSONResponse({"error": "Session not found"}, status_code=404)
+    while session.processing:
+        await asyncio.sleep(0.1)
+    if session.processing_error:
+        return JSONResponse({"error": f"读取失败: {session.processing_error}"}, status_code=500)
     control = ScanControl()
     scan_controls[session_id] = control
 
@@ -152,11 +215,62 @@ async def scan(request: Request):
                 yield _sse("page_progress", {"page_num": page_num, "status": "scanning"})
 
                 img_path = str(session.page_images[page_num - 1])
+                native_text = session.native_page_texts[page_num - 1] if page_num <= len(session.native_page_texts) else ""
+                native_page = session.native_pages[page_num - 1] if page_num <= len(session.native_pages) else {}
+                native_chars = len(re.sub(r"\s+", "", native_text))
+
+                # A usable digital PDF text layer is both faster and more exact.
+                # Native layout extraction restores tables and vector figures;
+                # genuinely scanned pages still use the visual OCR model.
+                if native_chars >= 120:
+                    markdown = native_page.get("markdown") or ocr_parser.native_text_to_markdown(native_text)
+                    detections = native_page.get("detections") or ocr_parser.native_text_to_detections(native_text)
+                    blocks = ocr_parser.reconstruct_structure(detections)
+                    html = ocr_parser.generate_html(detections, page_num)
+                    chunk_size = 320
+                    for end in range(chunk_size, len(markdown) + chunk_size, chunk_size):
+                        while control.paused.is_set() and not control.cancelled.is_set():
+                            await asyncio.sleep(0.08)
+                        if control.cancelled.is_set():
+                            stopped = True
+                            break
+                        partial = markdown[:min(end, len(markdown))]
+                        yield _sse("token", {
+                            "page_num": page_num,
+                            "text": partial,
+                            "markdown": partial,
+                            "tokens": max(1, len(partial) // 4),
+                            "done": end >= len(markdown),
+                            "source": "pdf_text",
+                        })
+                        await asyncio.sleep(0.025)
+                    if stopped:
+                        break
+                    session.page_results[page_num] = {
+                        "detections": detections, "html": html, "raw": native_text,
+                        "markdown": markdown, "blocks": blocks,
+                    }
+                    for i, det in enumerate(detections):
+                        yield _sse("det_result", {
+                            "page_num": page_num, "det_index": i,
+                            "detection": det, "html": ocr_parser.generate_det_html(det, i),
+                            "total_detections": len(detections),
+                        })
+                    yield _sse("page_done", {
+                        "page_num": page_num, "html": html, "markdown": markdown,
+                        "source": "pdf_text",
+                    })
+                    yield _sse("page_image", {
+                        "page_num": page_num,
+                        "image_url": f"/api/page-image/{session_id}/{page_num}",
+                    })
+                    continue
 
                 try:
                     if hasattr(ocr_engine, "ocr_page_stream"):
                         stream = ocr_engine.ocr_page_stream(img_path, max_length)
                         raw = ""
+                        stable_markdown = ""
                         while True:
                             while control.paused.is_set() and not control.cancelled.is_set():
                                 await asyncio.sleep(0.08)
@@ -168,10 +282,16 @@ async def scan(request: Request):
                             if done:
                                 break
                             raw = item["text"]
+                            live_markdown = ocr_parser.raw_to_markdown(raw, session_id, page_num)
+                            # The converted tokenizer can briefly decode the first
+                            # few snapshots as one repeated phrase, then replace the
+                            # whole prefix. Never animate that visibly unstable draft.
+                            if item.get("done") or not ocr_parser.is_repetitive_stream_artifact(live_markdown):
+                                stable_markdown = live_markdown
                             yield _sse("token", {
                                 "page_num": page_num,
                                 "text": raw,
-                                "markdown": ocr_parser.raw_to_markdown(raw, session_id, page_num),
+                                "markdown": stable_markdown,
                                 "tokens": item.get("tokens", 0),
                                 "done": item.get("done", False),
                                 "stats": item.get("stats"),
@@ -188,14 +308,23 @@ async def scan(request: Request):
                 if stopped:
                     break
 
+                # If a sparse digital page makes the visual model terminate
+                # implausibly early, retain the complete native text instead.
+                generated_markdown = ocr_parser.raw_to_markdown(raw, session_id, page_num)
+                if native_chars >= 120 and len(re.sub(r"\s+", "", generated_markdown)) < native_chars * 0.35:
+                    raw = native_text
+                    markdown = ocr_parser.native_text_to_markdown(native_text)
+                    detections = ocr_parser.native_text_to_detections(native_text)
+                else:
+                    markdown = generated_markdown
+                    detections = ocr_parser.parse_ocr_output(raw)
+
                 yield _sse("page_progress", {"page_num": page_num, "status": "parsing"})
 
-                detections = ocr_parser.parse_ocr_output(raw)
                 blocks = ocr_parser.reconstruct_structure(detections)
 
             # Store full results
                 html = ocr_parser.generate_html(detections, page_num)
-                markdown = ocr_parser.raw_to_markdown(raw, session_id, page_num)
                 session.page_results[page_num] = {
                     "detections": detections, "html": html, "raw": raw,
                     "markdown": markdown, "blocks": blocks,
@@ -364,7 +493,27 @@ async def export_docx(request: Request):
             "page_num": page_num,
             "blocks": result.get("blocks", []),
             "detections": result.get("detections", []),
+            "page_image": str(session.page_images[page_num - 1]),
         }
+        for det in page_data["detections"]:
+            if det.get("type") in {"image", "figure", "chart", "diagram"}:
+                bbox = det.get("bbox") or []
+                if len(bbox) >= 4:
+                    try:
+                        from PIL import Image
+                        with Image.open(session.page_images[page_num - 1]) as image:
+                            w, h = image.size
+                            box = (
+                                max(0, min(w, int(bbox[0] * w / 1000))),
+                                max(0, min(h, int(bbox[1] * h / 1000))),
+                                max(0, min(w, int(bbox[2] * w / 1000))),
+                                max(0, min(h, int(bbox[3] * h / 1000))),
+                            )
+                            crop = session.upload_dir / f"word-image-{page_num}-{bbox[0]}-{bbox[1]}-{bbox[2]}-{bbox[3]}.png"
+                            image.crop(box).save(crop, "PNG")
+                            det["image_path"] = str(crop)
+                    except Exception:
+                        pass
         if page_num in session.page_translations:
             page_data["translations"] = session.page_translations[page_num]
         pages.append(page_data)
@@ -389,13 +538,47 @@ async def export_markdown(request: Request):
     pages = []
     for page_num in sorted(session.page_results):
         markdown = session.page_results[page_num].get("markdown", "").strip()
+        markdown = _materialize_markdown_images(markdown, session, page_num)
         if session.total_pages > 1:
             pages.append(f"<!-- 第 {page_num} 页 -->\n\n{markdown}")
         else:
             pages.append(markdown)
-    output_path = session.upload_dir / f"{Path(session.source_name).stem}_ocr.md"
+    stem = Path(session.source_name).stem
+    output_path = session.upload_dir / f"{stem}_ocr.md"
     output_path.write_text("\n\n---\n\n".join(pages) + "\n", encoding="utf-8")
-    return FileResponse(output_path, media_type="text/markdown; charset=utf-8", filename=output_path.name)
+    bundle_path = session.upload_dir / f"{stem}_ocr_markdown.zip"
+    with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+        bundle.write(output_path, output_path.name)
+        image_dir = session.upload_dir / "images"
+        if image_dir.exists():
+            for image_path in sorted(image_dir.glob("*.png")):
+                bundle.write(image_path, f"images/{image_path.name}")
+    return FileResponse(bundle_path, media_type="application/zip", filename=bundle_path.name)
+
+
+def _materialize_markdown_images(markdown: str, session: SessionData, page_num: int) -> str:
+    """Copy region-image references beside the exported Markdown file."""
+    pattern = re.compile(r"!\[([^]]*)\]\(/api/region-image/[^/]+/(\d+)/([^)]*)\)")
+    image_dir = session.upload_dir / "images"
+    image_dir.mkdir(exist_ok=True)
+
+    def replace(match):
+        alt, pnum, coords = match.groups()
+        coords = unquote(coords)
+        src = session.page_images[int(pnum) - 1]
+        try:
+            from PIL import Image
+            x1, y1, x2, y2 = [int(float(x.strip())) for x in coords.split(",")]
+            with Image.open(src) as image:
+                w, h = image.size
+                # Detection boxes are in the model's 1000x1000 coordinate space.
+                box = (max(0, int(x1*w/1000)), max(0, int(y1*h/1000)), min(w, int(x2*w/1000)), min(h, int(y2*h/1000)))
+                name = f"page-{pnum}-{x1}-{y1}-{x2}-{y2}.png"
+                image.crop(box).save(image_dir / name, "PNG")
+            return f"![{alt}](images/{name})"
+        except Exception:
+            return match.group(0)
+    return pattern.sub(replace, markdown)
 
 
 # ── Run ────────────────────────────────────────────────────────

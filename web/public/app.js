@@ -21,8 +21,9 @@ const state = {
   typingTimer: null,
   typingFinal: false,
   typingPage: null,
-  followScanningPage: false,
+  followScanningPage: true,
   scanningPage: null,
+  markdownPageSize: null,
 };
 
 /* ── DOM refs ───────────────────────────────────── */
@@ -42,6 +43,10 @@ const ocrContent   = $('ocr-content');
 const progressBar  = $('progress-bar');
 const progressFill = $('progress-fill');
 const progressText = $('progress-text');
+const uploadProgress = $('upload-progress');
+const uploadProgressFill = $('upload-progress-fill');
+const uploadProgressText = $('upload-progress-text');
+const uploadProgressDetail = $('upload-progress-detail');
 const statusText   = $('status-text');
 const modelInfo    = $('model-info');
 const divider      = $('divider');
@@ -66,14 +71,12 @@ document.addEventListener('DOMContentLoaded', () => {
   prevBtn.addEventListener('click', () => goToPage(state.currentPage - 1));
   nextBtn.addEventListener('click', () => goToPage(state.currentPage + 1));
   transBtn.addEventListener('click', translatePage);
-  exportBtn.addEventListener('click', showExportDialog);
-  exportMenuBtn.addEventListener('click', () => {
-    exportMarkdown();
-  });
+  exportMenuBtn.addEventListener('click', toggleExportMenu);
   $('export-md-option').addEventListener('click', () => { closeExportMenu(); exportMarkdown(); });
   $('export-word-option').addEventListener('click', () => { closeExportMenu(); showExportDialog(); });
-  exportMenuBtn.parentElement.addEventListener('mouseenter', () => exportMenuBtn.setAttribute('aria-expanded', 'true'));
-  exportMenuBtn.parentElement.addEventListener('mouseleave', closeExportMenu);
+  document.addEventListener('click', e => {
+    if (!exportMenuBtn.parentElement.contains(e.target)) closeExportMenu();
+  });
   $('markdown-view-btn').addEventListener('click', () => setResultMode('markdown'));
   $('text-view-btn').addEventListener('click', () => setResultMode('text'));
   transLang.addEventListener('change', () => {
@@ -93,6 +96,7 @@ document.addEventListener('DOMContentLoaded', () => {
   setupKeyboard();
   const savedTheme = localStorage.getItem('ocr-theme');
   if (savedTheme) document.documentElement.dataset.theme = savedTheme;
+  updateThemeButton();
   checkHealth();
   if (window.mermaid) mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: document.documentElement.dataset.theme === 'dark' ? 'dark' : 'default' });
   new ResizeObserver(() => scheduleMarkdownFit()).observe(ocrContent);
@@ -117,6 +121,40 @@ async function checkHealth() {
 }
 
 /* ── Upload ─────────────────────────────────────── */
+function showUploadProgress(totalPages) {
+  uploadProgress.classList.remove('hidden');
+  uploadProgressFill.style.width = '0%';
+  uploadProgressText.textContent = '正在读取文档';
+  uploadProgressDetail.textContent = `解析页面 0 / ${totalPages} 页…`;
+  statusText.textContent = `正在读取 0 / ${totalPages} 页…`;
+}
+
+function updateUploadProgress(done, totalPages) {
+  const pct = totalPages > 0 ? Math.min(100, Math.round((done / totalPages) * 100)) : 0;
+  uploadProgressFill.style.width = `${pct}%`;
+  uploadProgressDetail.textContent = `解析页面 ${done} / ${totalPages} 页`;
+  uploadProgressText.textContent = pct >= 100 ? '读取完成' : '正在读取文档';
+  statusText.textContent = `正在读取 ${done} / ${totalPages} 页…`;
+}
+
+function hideUploadProgress() {
+  uploadProgress.classList.add('hidden');
+}
+
+async function waitForUpload(sessionId, totalPages) {
+  while (true) {
+    const r = await fetch(`/api/upload-progress/${sessionId}`);
+    const d = await r.json();
+    if (!r.ok || d.error) throw new Error(d.error || `服务器返回异常 (${r.status})`);
+    updateUploadProgress(d.processed_pages || 0, totalPages);
+    if (!d.processing) {
+      if (d.error) throw new Error(d.error);
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, 300));
+  }
+}
+
 async function handleUpload(e) {
   const file = e instanceof File ? e : e.target.files[0];
   if (!file) return;
@@ -142,10 +180,16 @@ async function handleUpload(e) {
       throw new Error(message);
     }
 
+    if (d.processing) {
+      showUploadProgress(d.total_pages);
+      await waitForUpload(d.session_id, d.total_pages);
+      hideUploadProgress();
+    }
+
     state.sessionId = d.session_id;
     state.totalPages = d.total_pages;
     state.currentPage = 1;
-    state.followScanningPage = false;
+    state.followScanningPage = true;
     state.pageResults = {};
     state.pageImageUrls = {};
     state.sourceName = d.source_name;
@@ -177,11 +221,13 @@ async function handleUpload(e) {
     renderPageList();
     showToast('文档已打开');
   } catch (err) {
+    hideUploadProgress();
     showToast('上传失败: ' + err.message);
     sourceView.classList.remove('uploading');
     srcPlaceholder.style.display = '';
     ocrContent.innerHTML = emptyResult('打开失败', '请重新拖入文件或点击「打开文档」');
   } finally {
+    hideUploadProgress();
     sourceView.classList.remove('uploading');
     delete sourceView.dataset.uploadName;
   }
@@ -191,6 +237,12 @@ async function handleUpload(e) {
 async function startScan() {
   if (state.scanning) return;
   state.scanning = true;
+  // Every new run, including a restart after Stop, begins in follow mode.
+  state.followScanningPage = true;
+  const followButton = $('follow-btn');
+  followButton.classList.add('active');
+  followButton.setAttribute('aria-pressed', 'true');
+  followButton.querySelector('span').textContent = '自动跟随';
   state.scanPaused = false;
   state.scanStopped = false;
   state.scanAbortController = new AbortController();
@@ -212,9 +264,9 @@ async function startScan() {
     const r = await fetch('/api/scan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      // A 2048-token ceiling is ample for ordinary pages and avoids very long
-      // generation runs on 16 GB Apple Silicon machines.
-      body: JSON.stringify({ session_id: state.sessionId, max_length: 2048 }),
+      // Dense pages can exceed 2K tokens; truncating mid-detection leaves
+      // grounding fragments in the final document. MLX caps this at 4096.
+      body: JSON.stringify({ session_id: state.sessionId, max_length: 4096 }),
       signal: state.scanAbortController.signal,
     });
 
@@ -314,7 +366,7 @@ function handleSSEChunk(chunk) {
       if (!state.pageResults[data.page_num]) state.pageResults[data.page_num] = { detections: [] };
       state.pageResults[data.page_num].raw = data.text;
       state.pageResults[data.page_num].markdown = data.markdown;
-      if (state.resultMode === 'markdown' && data.page_num === state.currentPage) {
+      if (!state.scanStopped && state.resultMode === 'markdown' && data.page_num === state.currentPage) {
         updateTypewriterTarget(data.markdown, Boolean(data.done), data.page_num);
       }
       progressDetail.textContent = `已生成 ${data.tokens || 0} tokens · 正在实时排版`;
@@ -328,7 +380,7 @@ function handleSSEChunk(chunk) {
         html: data.html,
         markdown: data.markdown,
       };
-      if (data.page_num === state.currentPage) {
+      if (!state.scanStopped && data.page_num === state.currentPage) {
         if (state.resultMode === 'markdown') updateTypewriterTarget(data.markdown, true, data.page_num);
         else renderOCRContent(data.html);
       }
@@ -509,8 +561,14 @@ async function stopScan() {
   if (!state.scanning) return;
   state.scanStopped = true;
   state.scanPaused = false;
+  clearTimeout(state.typingTimer);
+  state.typingTimer = null;
   state.typingTarget = state.typingCurrent;
   state.typingFinal = true;
+  if (state.resultMode === 'markdown') {
+    renderMarkdown(state.typingCurrent, false);
+    requestAnimationFrame(scheduleMarkdownFit);
+  }
   $('stop-btn').disabled = true;
   progressText.textContent = '正在停止…';
   const controller = state.scanAbortController;
@@ -529,6 +587,9 @@ function renderMarkdown(markdown, live = false) {
     const safe = window.DOMPurify ? DOMPurify.sanitize(parsed, { USE_PROFILES: { html: true, svg: true, svgFilters: true } }) : parsed;
     ocrContent.classList.add('markdown-preview');
     ocrContent.innerHTML = `<article class="markdown-body${live ? ' is-live' : ''}"><div class="markdown-page-content">${safe}${live ? '<span class="stream-cursor"></span>' : ''}</div></article>`;
+    // The typewriter replaces the article on every character. Size the new
+    // element immediately so there is never a one-frame auto-sized flash.
+    fitMarkdownPreview();
     scheduleMarkdownFit();
     if (!live) enhanceMarkdown(ocrContent.querySelector('.markdown-body'));
   } catch (err) {
@@ -568,22 +629,20 @@ function fitMarkdownPreview() {
   const content = page?.querySelector('.markdown-page-content');
   if (!page || !content || state.resultMode !== 'markdown') return;
 
-  const sourceViewRect = sourceView.getBoundingClientRect();
-  const sourceImageRect = srcImg.classList.contains('loaded') ? srcImg.getBoundingClientRect() : null;
-  const topGap = sourceImageRect
-    ? Math.max(12, Math.min(64, sourceImageRect.top - sourceViewRect.top))
-    : 20;
+  const fittedPage = getFittedPageSize();
   const availableWidth = Math.max(120, ocrContent.clientWidth - 4);
-  const availableHeight = Math.max(120, ocrContent.clientHeight - topGap - 4);
+  const topGap = Math.max(0, (ocrContent.clientHeight - fittedPage.height) / 2);
+  const availableHeight = Math.max(120, ocrContent.clientHeight - topGap * 2);
   const sourceAspect = srcImg.naturalWidth && srcImg.naturalHeight
     ? srcImg.naturalWidth / srcImg.naturalHeight
     : 0.707;
 
-  // fitImage() constrains the source to the space shared by both panels, so
-  // use its actual rendered dimensions for exact edge-to-edge alignment.
-  let pageWidth = sourceImageRect?.width || Math.min(availableWidth, availableHeight * sourceAspect);
-  let pageHeight = sourceImageRect?.height || pageWidth / sourceAspect;
-  if (pageWidth > availableWidth || pageHeight > availableHeight) {
+  // Use the same deterministic A4 box as fitImage(). Reading getBoundingClientRect()
+  // here used to capture an intermediate value from the image's CSS transition
+  // during page 1 streaming and permanently lock the Markdown canvas too small.
+  let pageWidth = state.markdownPageSize?.width || fittedPage.width;
+  let pageHeight = state.markdownPageSize?.height || fittedPage.height;
+  if (!state.markdownPageSize && (pageWidth > availableWidth || pageHeight > availableHeight)) {
     const sharedScale = Math.min(availableWidth / pageWidth, availableHeight / pageHeight);
     pageWidth *= sharedScale;
     pageHeight *= sharedScale;
@@ -591,17 +650,28 @@ function fitMarkdownPreview() {
   page.style.width = `${Math.floor(pageWidth)}px`;
   page.style.height = `${Math.floor(pageHeight)}px`;
   page.style.marginTop = `${Math.round(topGap)}px`;
+  if (!state.markdownPageSize) {
+    state.markdownPageSize = { width: pageWidth, height: pageHeight };
+  }
 
   // 小四号 = 12 pt. Convert that physical size onto the displayed A4 sheet:
   // 1 pt = 25.4 / 72 mm; portrait A4 width = 210 mm (landscape = 297 mm).
   // The result therefore follows the paper scale instead of a hard-coded px.
   const a4WidthMm = sourceAspect > 1 ? 297 : 210;
   const smallFourMm = 12 * 25.4 / 72;
-  const fontSize = pageWidth * smallFourMm / a4WidthMm;
+  const baseFontSize = pageWidth * smallFourMm / a4WidthMm;
   content.style.transform = '';
-  content.style.fontSize = `${fontSize}px`;
+  content.style.fontSize = `${baseFontSize}px`;
   content.style.lineHeight = '1.5';
-  const renderScale = 1;
+  // Render at physical 小四号 first, then shrink only when the generated
+  // Markdown exceeds the same A4 canvas used by the source preview.
+  const innerWidth = Math.max(1, pageWidth * 0.89);
+  const innerHeight = Math.max(1, pageHeight * 0.91);
+  const contentWidth = Math.max(content.scrollWidth, content.offsetWidth);
+  const contentHeight = Math.max(content.scrollHeight, content.offsetHeight);
+  const renderScale = Math.min(1, innerWidth / contentWidth, innerHeight / contentHeight);
+  const fontSize = baseFontSize * Math.max(0.35, renderScale);
+  content.style.fontSize = `${fontSize}px`;
   page.dataset.fontSize = fontSize.toFixed(1);
   page.dataset.renderScale = renderScale.toFixed(3);
 }
@@ -609,10 +679,14 @@ function fitMarkdownPreview() {
 function loadPageImage(pageNum) {
   const url = state.pageImageUrls[pageNum];
   if (url) {
+    state.markdownPageSize = null;
+    srcImg.classList.remove('loaded');
     srcImg.onload = () => {
       srcImg.classList.add('loaded');
       srcPlaceholder.style.display = 'none';
       fitImage();
+      const fittedPage = getFittedPageSize();
+      state.markdownPageSize = { width: fittedPage.width, height: fittedPage.height };
       scheduleMarkdownFit();
       setTimeout(scheduleMarkdownFit, 220);
     };
@@ -626,8 +700,15 @@ function loadPageImage(pageNum) {
 
 function goToPage(num, manual = true) {
   if (num < 1 || num > state.totalPages) return;
-  if (manual) state.followScanningPage = false;
+  if (manual) {
+    state.followScanningPage = false;
+    const followButton = $('follow-btn');
+    followButton.classList.remove('active');
+    followButton.setAttribute('aria-pressed', 'false');
+    followButton.querySelector('span').textContent = '开启跟随';
+  }
   resetTypewriter();
+  state.markdownPageSize = null;
   state.currentPage = num;
   pageInd.textContent = `${num} / ${state.totalPages}`;
   prevBtn.disabled = num <= 1;
@@ -670,6 +751,12 @@ function toggleFollowScanning() {
 
 function closeExportMenu() {
   exportMenuBtn?.setAttribute('aria-expanded', 'false');
+}
+
+function toggleExportMenu(e) {
+  e.stopPropagation();
+  const open = exportMenuBtn.getAttribute('aria-expanded') === 'true';
+  exportMenuBtn.setAttribute('aria-expanded', String(!open));
 }
 
 function buildDetHtml(det, index) {
@@ -868,10 +955,10 @@ async function exportMarkdown() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${state.sourceName.replace(/\.[^.]+$/, '')}_ocr.md`;
+    a.download = `${state.sourceName.replace(/\.[^.]+$/, '')}_ocr_markdown.zip`;
     a.click();
     URL.revokeObjectURL(url);
-    showToast('Markdown 已下载');
+    showToast('Markdown 与图片包已下载');
   } catch (err) { showToast('Markdown 导出失败: ' + err.message); }
   exportMenuBtn.disabled = false;
   statusText.textContent = '就绪';
@@ -979,22 +1066,44 @@ function fitImage() {
   // Both panels display the same page at the same pixel dimensions. This is
   // slightly smaller than fitting each panel independently, but aligns all
   // four paper edges even when the panels have different widths.
-  const sharedRightWidth = ocrContent?.clientWidth ? ocrContent.clientWidth - 4 : Infinity;
-  const availableW = Math.max(1, Math.min(sourceView.clientWidth - 40, sharedRightWidth));
-  const availableH = Math.max(1, sourceView.clientHeight - 40);
-  const scale = Math.min(1, availableW / srcImg.naturalWidth, availableH / srcImg.naturalHeight) * 0.98;
-  setZoom(scale);
+  const { width: pageWidth, height: pageHeight } = getFittedPageSize();
+  srcImg.style.width = `${pageWidth}px`;
+  srcImg.style.height = `${pageHeight}px`;
+  state.zoom = pageWidth / srcImg.naturalWidth;
+  zoomLevel.textContent = '适应';
   sourceView.classList.remove('zoomed');
   sourceView.scrollTop = 0;
   sourceView.scrollLeft = 0;
+}
+
+function getFittedPageSize() {
+  const sharedRightWidth = ocrContent?.clientWidth ? ocrContent.clientWidth - 4 : Infinity;
+  const availableW = Math.max(1, Math.min(sourceView.clientWidth - 40, sharedRightWidth));
+  const availableH = Math.max(1, sourceView.clientHeight - 40);
+  // PDF pages may be rasterized at different pixel densities; their physical
+  // preview remains A4 so every page gets an identical CSS-pixel canvas.
+  const pageAspect = 595.32 / 842.04;
+  const width = Math.floor(Math.min(availableW, availableH * pageAspect) * 0.98);
+  return { width, height: Math.floor(width / pageAspect) };
 }
 
 function toggleTheme() {
   const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
   document.documentElement.dataset.theme = next;
   localStorage.setItem('ocr-theme', next);
+  updateThemeButton();
   if (window.mermaid) mermaid.initialize({ startOnLoad: false, securityLevel: 'strict', theme: next === 'dark' ? 'dark' : 'default' });
   if (state.resultMode === 'markdown') renderMarkdown(state.pageResults[state.currentPage]?.markdown || '', state.scanning);
+}
+
+function updateThemeButton() {
+  const dark = document.documentElement.dataset.theme === 'dark';
+  const button = $('theme-btn');
+  button.title = dark ? '切换浅色模式' : '切换深色模式';
+  button.setAttribute('aria-label', button.title);
+  button.innerHTML = dark
+    ? '<svg class="moon-icon" viewBox="0 0 24 24"><path d="M20 15.5A8.5 8.5 0 0 1 8.5 4 8.5 8.5 0 1 0 20 15.5z"/></svg>'
+    : '<svg class="sun-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41"/></svg>';
 }
 
 async function copyResult() {

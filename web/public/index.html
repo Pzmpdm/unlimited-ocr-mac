@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="light dark">
   <title>Unlimited OCR · 文档工作台</title>
-  <link rel="stylesheet" href="/static/style.css?v=36">
+  <link rel="stylesheet" href="/static/style.css?v=54">
 </head>
 <body>
   <div class="app-shell">
@@ -38,13 +38,13 @@
             <span>导出为</span><span class="menu-chevron">⌄</span>
           </button>
           <div id="export-menu" class="export-menu-list" role="menu">
-            <button id="export-md-option" type="button" role="menuitem">Markdown <small>默认</small></button>
+            <button id="export-md-option" type="button" role="menuitem">Markdown + 图片 <small>ZIP · 默认</small></button>
             <button id="export-word-option" type="button" role="menuitem">Word</button>
           </div>
         </div>
-        <button id="follow-btn" class="btn secondary follow-btn" type="button" aria-pressed="false" title="开启后自动跟随 OCR 当前识别页">
+        <button id="follow-btn" class="btn secondary follow-btn active" type="button" aria-pressed="true" title="自动跟随 OCR 当前识别页">
           <svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 0 1 14-5M20 12a8 8 0 0 1-14 5M18 4v4h-4M6 20v-4h4"/></svg>
-          <span>开启跟随</span>
+          <span>自动跟随</span>
         </button>
       </div>
     </header>
@@ -105,6 +105,13 @@
             <p>支持 PDF、PNG、JPG、WebP 和 BMP</p>
             <label class="btn primary" for="file-input">选择文件</label>
           </div>
+          <div id="upload-progress" class="upload-progress hidden">
+            <div class="upload-progress-copy">
+              <span class="spinner"></span>
+              <div><strong id="upload-progress-text">正在读取文档</strong><small id="upload-progress-detail">解析页面结构中…</small></div>
+            </div>
+            <div class="progress-track"><div id="upload-progress-fill"></div></div>
+          </div>
           <div id="drop-overlay" class="drop-overlay"><strong>松开即可打开文档</strong></div>
         </div>
       </section>
@@ -164,6 +171,6 @@
     };
   </script>
   <script src="/static/vendor/tex-svg.js"></script>
-  <script src="/static/app.js?v=36"></script>
+  <script src="/static/app.js?v=54"></script>
 </body>
 </html>

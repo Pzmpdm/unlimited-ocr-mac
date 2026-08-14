@@ -77,6 +77,33 @@ def _clean_generated_text(decoder, token_ids: list[int]) -> str:
     return text
 
 
+def _sliding_no_repeat_ngram(ngram_size: int = 35, window: int = 128):
+    """MLX equivalent of Unlimited-OCR's native repetition blocker."""
+    import mlx.core as mx
+
+    def processor(tokens, logits):
+        sequence = tokens.tolist()
+        if len(sequence) < ngram_size:
+            return logits
+
+        search_start = max(0, len(sequence) - window)
+        search_end = len(sequence) - ngram_size + 1
+        if search_end <= search_start:
+            return logits
+
+        prefix = tuple(sequence[-(ngram_size - 1) :]) if ngram_size > 1 else ()
+        banned = []
+        for index in range(search_start, search_end):
+            ngram = sequence[index : index + ngram_size]
+            if ngram_size == 1 or tuple(ngram[:-1]) == prefix:
+                banned.append(ngram[-1])
+        if banned:
+            logits[:, list(set(banned))] = -mx.inf
+        return logits
+
+    return processor
+
+
 def ocr_page_stream(image_path: str, max_length: int = 2048):
     """Yield progressively decoded OCR snapshots and a final statistics item."""
     global _last_stats
@@ -94,10 +121,16 @@ def ocr_page_stream(image_path: str, max_length: int = 2048):
         for response in stream_generate(
             model,
             processor,
-            "<image><|grounding|>Convert the document to markdown.",
+            # This is the model's layout-aware OCR prompt. The shorter
+            # "document parsing" prompt can terminate after only a few tokens
+            # on sparse cover pages in the quantized MLX conversion.
+            "<image>\n<|grounding|>Given the layout of the image. ",
             image=str(image_path),
             max_tokens=max_tokens,
             temperature=0.0,
+            # Match the native implementation's defaults. Without this, the
+            # quantized MLX model can get trapped repeating a short phrase.
+            logits_processors=[_sliding_no_repeat_ngram(35, 128)],
         ):
             last = response
             if response.token is not None:

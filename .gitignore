@@ -29,6 +29,7 @@ model_dir_patched/
 /test_output/
 test-output/
 mcp_output/
+web/stress_pdfs/
 
 # macOS
 .DS_Store

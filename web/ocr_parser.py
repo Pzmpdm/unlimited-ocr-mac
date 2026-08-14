@@ -15,12 +15,19 @@ def parse_ocr_output(raw: str) -> list[dict]:
         line = line.strip()
         if not line:
             continue
+        if _is_model_artifact(line):
+            continue
         m = pattern.match(line)
         if m:
             det_type = m.group(1)
             bbox_str = m.group(2)
             text = m.group(3).strip()
-            bbox = [int(x.strip()) for x in bbox_str.split(",") if x.strip()]
+            try:
+                bbox = [int(x.strip()) for x in bbox_str.split(",") if x.strip()]
+            except ValueError:
+                # A truncated/looping model response must not abort the entire
+                # scan merely because one grounding coordinate is malformed.
+                bbox = []
             detections.append({"type": det_type, "bbox": bbox, "text": text})
         else:
             # Fallback: treat whole line as text
@@ -28,6 +35,78 @@ def parse_ocr_output(raw: str) -> list[dict]:
                 detections.append({"type": "text", "bbox": [], "text": line})
 
     return detections
+
+
+def native_text_to_markdown(text: str) -> str:
+    """Turn a digital PDF text layer into readable, conservative Markdown."""
+    lines = []
+    for raw_line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            if lines and lines[-1] != "":
+                lines.append("")
+            continue
+        if stripped.lower() == "index of contents":
+            lines.append(f"# {stripped}")
+        elif re.match(r"^\d+\.\s+[A-Z][A-Z\s,&/()\-]+(?:\.{2,}\s*\d+)?$", stripped):
+            lines.append(f"## {stripped}")
+        else:
+            lines.append(stripped)
+    return "\n".join(lines).strip()
+
+
+def native_text_to_detections(text: str) -> list[dict]:
+    """Create editable result blocks from an embedded PDF text layer."""
+    detections = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        is_heading = (
+            line.lower() == "index of contents"
+            or bool(re.match(r"^\d+\.\s+[A-Z][A-Z\s,&/()\-]+", line))
+        )
+        detections.append({"type": "title" if is_heading else "text", "bbox": [], "text": line})
+    return detections
+
+
+def _is_model_artifact(line: str) -> bool:
+    """Return true for grounding/debug fragments that are not document text."""
+    stripped = line.strip()
+    if stripped.lower() in {"[non-text]", "[non text]", "[non_text]"}:
+        return True
+    if "<|det|>" in stripped and "<|/det|>" not in stripped:
+        return True
+    return bool(re.fullmatch(
+        r"(?:text|title|image|figure|chart|diagram|table|formula|page_number)\s*\[[\d\s,.-]*\]",
+        stripped,
+        flags=re.IGNORECASE,
+    ))
+
+
+def is_repetitive_stream_artifact(markdown: str) -> bool:
+    """Detect an unstable partial decode without rejecting final OCR text."""
+    lines = [line.strip() for line in markdown.splitlines() if line.strip()]
+    if len(lines) < 3:
+        return False
+
+    normalized = [
+        re.sub(
+            r"^(?:text|title|image|figure|chart|diagram|table|formula|page_number)\s*\[[^\]]*\]\s*",
+            "",
+            line,
+            flags=re.IGNORECASE,
+        ).strip()
+        for line in lines
+    ]
+    normalized = [line for line in normalized if line]
+    if len(normalized) < 3:
+        return False
+
+    counts = {line: normalized.count(line) for line in set(normalized)}
+    most_repeated = max(counts.values(), default=0)
+    return most_repeated >= 3 and most_repeated / len(normalized) >= 0.5
 
 
 def reconstruct_structure(detections: list[dict]) -> list[dict]:
@@ -186,9 +265,21 @@ def raw_to_markdown(raw: str, session_id: str = "", page_num: int = 1) -> str:
         return ""
 
     markdown = pattern.sub(replace_detection, raw)
+    # Some pages make the model emit internal non-text placeholders or a
+    # truncated grounding record. They are useful to the model but must never
+    # appear in the document preview/export.
+    markdown = re.sub(r"(?im)^\s*\[non[-_ ]?text\]\s*$", "", markdown)
+    markdown = re.sub(r"(?im)^\s*<\|det\|>[^\n]*(?:<\|/det\|>)?\s*$", "", markdown)
+    markdown = re.sub(
+        r"(?im)^\s*(?:text|title|image|figure|chart|diagram|table|formula|page_number)\s*\[[\d\s,.-]*\]\s*$",
+        "",
+        markdown,
+    )
+    markdown = re.sub(r"<\|/?det\|>", "", markdown)
     markdown = re.sub(r"<\|/?(?:ref|grounding)\|>", "", markdown)
     markdown = markdown.replace("<｜end▁of▁sentence｜>", "")
     markdown = re.sub(r"^(#{1,6})\s+(#{1,6})\s+", r"\2 ", markdown, flags=re.MULTILINE)
+    markdown = re.sub(r"\n{3,}", "\n\n", markdown)
     return markdown.strip()
 
 
