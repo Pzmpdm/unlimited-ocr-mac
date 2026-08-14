@@ -59,15 +59,19 @@ def _join_span_texts(spans: list[dict]) -> str:
     spans = sorted(spans, key=lambda span: (span["x0"], span["y0"]))
     if not spans:
         return ""
+    base_size = max(span["size"] for span in spans)
     out = spans[0]["text"]
     for previous, current in zip(spans, spans[1:]):
         gap = current["x0"] - previous["x1"]
-        is_smaller = current["size"] < previous["size"] * 0.78
+        # A glyph is a sub/superscript fragment when it is clearly smaller than
+        # the line's dominant size, even if the previous fragment is equally
+        # small (a wrapped subscript such as "tIDLE_wacc_n" + "m").
+        is_small = current["size"] < base_size * 0.78
         previous_center = (previous["y0"] + previous["y1"]) / 2
         current_center = (current["y0"] + current["y1"]) / 2
         same_baseline = abs(previous_center - current_center) < 3.0
-        is_superscript = is_smaller and current_center < previous_center - 0.5
-        if is_smaller or (gap < 1.7 and same_baseline):
+        is_superscript = is_small and current_center < previous_center - 0.5
+        if is_small or (gap < 1.7 and same_baseline):
             out += ("^" + current["text"]) if is_superscript else current["text"]
         elif not (out.endswith(" ") or current["text"].startswith((" ", "\u00a0"))):
             out += " " + current["text"]
@@ -222,15 +226,28 @@ def _join_cell_text(spans: list[dict]) -> str:
     if not spans:
         return ""
     centers = _cluster_values([(s["y0"] + s["y1"]) / 2 for s in spans], 7.0)
-    lines = []
+    groups = []
     for center in centers:
         group = [
             span for span in spans
             if abs((span["y0"] + span["y1"]) / 2 - center)
             == min(abs((span["y0"] + span["y1"]) / 2 - c) for c in centers)
         ]
-        lines.append(_join_span_texts(group))
-    return " ".join(line for line in lines if line)
+        groups.append(group)
+    # A wrapped subscript line (all glyphs smaller than the cell's dominant
+    # size) continues the previous line instead of becoming a separate line.
+    max_size = max(span["size"] for span in spans)
+    merged: list[list[dict]] = []
+    for group in groups:
+        if (
+            merged
+            and group
+            and all(span["size"] < max_size * 0.78 for span in group)
+        ):
+            merged[-1].extend(group)
+        else:
+            merged.append(group)
+    return " ".join(_join_span_texts(group) for group in merged if group)
 
 
 def _cluster_values(values: list[float], tolerance: float) -> list[float]:
@@ -315,12 +332,16 @@ def _text_column_bounds(spans: list[dict], table_bbox: tuple, min_rows: int = 2)
     return deduped
 
 
-def _horizontal_row_lines(page, table_bbox: tuple, drawings=None, min_coverage: float = 0.35) -> list[float]:
+def _horizontal_row_lines(page, table_bbox: tuple, drawings=None, spans=None,
+                          min_coverage: float = 0.35) -> list[float]:
     """Recover row-boundary y-positions from the table's horizontal rulings.
 
     Ruled tables frequently draw each cell border as a separate short rectangle
     or line (Table 8 draws ~30 pt segments per column). Segments are therefore
-    clustered by y and their widths summed before the coverage check.
+    clustered by y and their widths summed before the coverage check. A ruling
+    that only covers part of the table width and cuts through a text span is a
+    row-internal divider (for example the two condition lines of one timing
+    row), not a row boundary, and is dropped.
     """
     x0, y0, x1, y1 = table_bbox
     width = x1 - x0
@@ -335,26 +356,41 @@ def _horizontal_row_lines(page, table_bbox: tuple, drawings=None, min_coverage: 
                 ax0, ax1 = min(p1.x, p2.x), max(p1.x, p2.x)
                 ay0, ay1 = min(p1.y, p2.y), max(p1.y, p2.y)
                 if ay1 - ay0 < 0.5 and ax1 - ax0 > 5:
-                    strokes.append(((ay0 + ay1) / 2, ax1 - ax0))
+                    strokes.append(((ay0 + ay1) / 2, ax1 - ax0, ax0, ax1))
             elif item[0] == "re":
                 rect2 = item[1]
                 if rect2.height < 0.7 and rect2.width > 5:
-                    strokes.append(((rect2.y0 + rect2.y1) / 2, rect2.width))
+                    strokes.append((
+                        (rect2.y0 + rect2.y1) / 2, rect2.width, rect2.x0, rect2.x1
+                    ))
     strokes.sort()
     groups = []
-    for y, seg_width in strokes:
+    for y, seg_width, lo, hi in strokes:
         if groups and y - groups[-1]["last"] <= 5.0:
             group = groups[-1]
             group["count"] += 1
             group["sum_y"] += y
             group["width"] += seg_width
+            group["lo"] = min(group["lo"], lo)
+            group["hi"] = max(group["hi"], hi)
             group["last"] = y
         else:
-            groups.append({"sum_y": y, "width": seg_width, "count": 1, "last": y})
+            groups.append({
+                "sum_y": y, "width": seg_width, "count": 1,
+                "lo": lo, "hi": hi, "last": y,
+            })
     positions = []
     for group in groups:
         center = group["sum_y"] / group["count"]
         if group["width"] >= width * min_coverage and y0 + 2 < center < y1 - 2:
+            if spans is not None and group["hi"] - group["lo"] < width * 0.6:
+                cuts_text = any(
+                    span["y0"] - 0.5 < center < span["y1"] + 0.5
+                    for span in spans
+                    if x0 <= span["x0"] <= x1
+                )
+                if cuts_text:
+                    continue
             positions.append(center)
     return positions
 
@@ -378,6 +414,7 @@ def _anchor_column_index(page, table, spans: list[dict], col_bounds: list[float]
             span for span in spans
             if span["x0"] <= col_bounds[column + 1] + 1
             and span["x1"] >= col_bounds[column] - 1
+            and span["size"] >= 8
         ]
         centers = _cluster_values(
             [(span["y0"] + span["y1"]) / 2 for span in col_spans], 4.0
@@ -396,7 +433,7 @@ def _anchor_column_index(page, table, spans: list[dict], col_bounds: list[float]
         return default
 
     if hlines is None:
-        hlines = _horizontal_row_lines(page, table.bbox)
+        hlines = _horizontal_row_lines(page, table.bbox, None, spans)
     col1 = next((entry for entry in stats if entry[0] == 1), None)
     if hlines:
         expected = len(hlines) + 1
@@ -474,7 +511,7 @@ def _table_row_bounds(page, table, spans: list[dict], col_bounds: list[float],
     """
     x0, y0, x1, y1 = table.bbox
     if hlines is None:
-        hlines = _horizontal_row_lines(page, table.bbox)
+        hlines = _horizontal_row_lines(page, table.bbox, None, spans)
     if len(hlines) >= 2:
         bounds = [y0, *hlines, y1]
         deduped = []
@@ -651,7 +688,7 @@ def _extract_tables(page, skip_boxes: list[tuple] | None = None,
         col_bounds = _vertical_column_bounds(page, table.bbox, drawings, spans)
         if len(col_bounds) < 3:
             continue
-        hlines = _horizontal_row_lines(page, table.bbox, drawings)
+        hlines = _horizontal_row_lines(page, table.bbox, drawings, spans)
         row_bounds = _table_row_bounds(page, table, inside, col_bounds, hlines)
 
         grid = []
