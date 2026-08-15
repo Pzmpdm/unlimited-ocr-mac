@@ -33,3 +33,7 @@ svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.8;stroke
 .page-item.failed .page-item-meta span{color:var(--danger)}
 .page-item.warning .page-thumb{outline:2px solid var(--warning)}
 .page-item.failed .page-thumb{outline:2px solid var(--danger)}
+
+/* ── Page failure card (Issue 3) ── */
+.page-error .page-error-msg{margin:4px 0 12px;color:var(--danger);font-size:13px;word-break:break-word}
+.page-error button{margin-top:4px}

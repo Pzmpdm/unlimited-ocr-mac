@@ -24,6 +24,7 @@ const state = {
   followScanningPage: true,
   scanningPage: null,
   markdownPageSize: null,
+  scanSummary: null,
 };
 
 /* ── DOM refs ───────────────────────────────────── */
@@ -76,6 +77,10 @@ document.addEventListener('DOMContentLoaded', () => {
   $('export-word-option').addEventListener('click', () => { closeExportMenu(); showExportDialog(); });
   document.addEventListener('click', e => {
     if (!exportMenuBtn.parentElement.contains(e.target)) closeExportMenu();
+  });
+  document.addEventListener('click', e => {
+    const retryBtn = e.target.closest('[data-retry-page]');
+    if (retryBtn) retryPage(parseInt(retryBtn.dataset.retryPage, 10));
   });
   $('markdown-view-btn').addEventListener('click', () => setResultMode('markdown'));
   $('text-view-btn').addEventListener('click', () => setResultMode('text'));
@@ -245,6 +250,7 @@ async function startScan() {
   followButton.querySelector('span').textContent = '自动跟随';
   state.scanPaused = false;
   state.scanStopped = false;
+  state.scanSummary = null;
   state.scanAbortController = new AbortController();
   resetTypewriter();
   $('pause-btn').textContent = '暂停';
@@ -308,7 +314,11 @@ async function startScan() {
   stopTimer();
   exportBtn.disabled = false;
   copyBtn.disabled = false;
-  statusText.textContent = state.scanStopped ? '识别已停止' : `扫描完成 (${state.totalPages} 页)`;
+  const summary = state.scanSummary;
+  statusText.textContent = state.scanStopped ? '识别已停止'
+    : (summary && summary.failed_pages > 0)
+      ? `识别完成：${summary.done_pages} 页成功，${summary.failed_pages} 页失败`
+      : `扫描完成 (${state.totalPages} 页)`;
   updateResultStats();
 }
 
@@ -381,6 +391,7 @@ function handleSSEChunk(chunk) {
         html: data.html,
         markdown: data.markdown,
         truncated: Boolean(data.truncated),
+        error: null,
       };
       if (!state.scanStopped && data.page_num === state.currentPage) {
         if (state.resultMode === 'markdown') updateTypewriterTarget(data.markdown, true, data.page_num);
@@ -398,11 +409,15 @@ function handleSSEChunk(chunk) {
 
     case 'scan_complete':
       progressFill.style.width = '100%';
-      progressText.textContent = '扫描完成!';
+      state.scanSummary = data;
+      const failedCount = data.failed_pages || 0;
+      progressText.textContent = failedCount > 0
+        ? `识别完成：${data.done_pages || 0} 页成功，${failedCount} 页失败`
+        : '扫描完成!';
       exportBtn.disabled = false;
       exportMenuBtn.disabled = false;
       copyBtn.disabled = false;
-      progressDetail.textContent = '所有页面均已处理完成';
+      progressDetail.textContent = failedCount > 0 ? '存在失败页面，可点击页面列表中的「重新识别本页」' : '所有页面均已处理完成';
       break;
 
     case 'scan_stopped':
@@ -412,7 +427,10 @@ function handleSSEChunk(chunk) {
       break;
 
     case 'error':
-      showToast(`第 ${data.page_num} 页出错: ${data.message}`);
+      if (!state.pageResults[data.page_num]) state.pageResults[data.page_num] = { detections: [] };
+      state.pageResults[data.page_num].error = data.message;
+      setPageStatus(data.page_num, 'failed');
+      if (data.page_num === state.currentPage) renderPageError(data.page_num, data.message);
       break;
   }
 }
@@ -1051,6 +1069,56 @@ function updatePageWarning() {
   const show = Boolean(result && result.truncated);
   warning.classList.toggle('hidden', !show);
   if (show) $('page-warning-text').textContent = '⚠ 本页达到 OCR 最大生成长度，结果可能不完整';
+}
+
+// Page-level failure card with a retry button (Issue 3).
+function renderPageError(pageNum, message) {
+  const escaped = escapeHtml(message || '未知错误');
+  ocrContent.innerHTML = `
+    <div class="result-empty page-error">
+      <div class="result-empty-icon"><svg viewBox="0 0 24 24"><path d="M12 3 2.5 20h19L12 3z"/><path d="M12 10v5M12 18h.01"/></svg></div>
+      <h2>本页识别失败</h2>
+      <p class="page-error-msg">${escaped}</p>
+      <button class="btn primary" data-retry-page="${pageNum}">重新识别本页</button>
+    </div>`;
+}
+
+async function retryPage(pageNum) {
+  if (!state.sessionId) return;
+  const page = pageNum || state.currentPage;
+  if (state.scanning) { showToast('请先停止当前扫描再重试'); return; }
+  showToast(`正在重新识别第 ${page} 页…`);
+  try {
+    const r = await fetch(`/api/scan-page/${state.sessionId}/${page}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ max_length: 8192, force_mode: null }),
+    });
+    if (!r.ok) { const d = await r.json().catch(() => ({})); showToast(d.error || '重试失败'); return; }
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      while (true) {
+        const boundary = buf.includes('\r\n\r\n') ? '\r\n\r\n' : (buf.includes('\n\n') ? '\n\n' : null);
+        if (!boundary) break;
+        const idx = buf.indexOf(boundary);
+        const chunk = buf.substring(0, idx);
+        buf = buf.substring(idx + boundary.length);
+        if (chunk.trim()) handleSSEChunk(chunk);
+      }
+    }
+    if (buf.trim()) handleSSEChunk(buf);
+  } catch (err) {
+    showToast('重试失败: ' + err.message);
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 function setupDropZone() {

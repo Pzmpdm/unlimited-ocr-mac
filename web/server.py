@@ -38,7 +38,7 @@ import ocr_parser
 import translator
 import docx_exporter
 from urllib.parse import unquote
-from config import PUBLIC_DIR, UPLOAD_DIR, PORT, HOST
+from config import PUBLIC_DIR, UPLOAD_DIR, PORT, HOST, DEFAULT_MAX_LENGTH
 
 
 # ── Session store ──────────────────────────────────────────────
@@ -56,6 +56,10 @@ class SessionData:
         self.native_page_texts = native_page_texts or [""] * total_pages
         self.native_pages = native_pages or [{} for _ in range(total_pages)]
         self.page_results: dict[int, dict] = {}  # page_num → {detections, html, raw, blocks}
+        self.page_status: dict[int, dict] = {  # page_num → {state, error, attempts}
+            page: {"state": "pending", "error": None, "attempts": 0}
+            for page in range(1, total_pages + 1)
+        }
         self.page_translations: dict[int, list] = {}
         self.created_at = time.time()
         self.processing = False
@@ -187,12 +191,230 @@ async def upload_progress(session_id: str):
     }
 
 
+# ── Page processing (shared by /api/scan and /api/scan-page) ─────
+
+def _resolve_engine():
+    """Return the module-level OCR engine (injectable for tests)."""
+    return ocr_engine
+
+
+def _route_page(native_page: dict, native_chars: int, force_mode: Optional[str] = None) -> str:
+    """Choose native / hybrid / vlm for a page.
+
+    Issue 4 replaces this heuristic with page_router.choose_page_route; until
+    then it keeps the historical native_chars >= 120 behaviour so the page
+    status / retry work can land independently.
+    """
+    if force_mode in ("native", "hybrid", "vlm"):
+        if force_mode == "hybrid":
+            # Hybrid lands with Issue 5; until then it behaves like native.
+            return "native"
+        return force_mode
+    return "native" if native_chars >= 120 else "vlm"
+
+
+async def _stream_native_page(session, page_num, control, native_page, native_text):
+    """Stream events for a page rendered entirely from the PDF text layer."""
+    markdown = native_page.get("markdown") or ocr_parser.native_text_to_markdown(native_text)
+    detections = native_page.get("detections") or ocr_parser.native_text_to_detections(native_text)
+    for det in detections:
+        det.setdefault("source", "native")
+    blocks = ocr_parser.reconstruct_structure(detections)
+    html = ocr_parser.generate_html(detections, page_num)
+    chunk_size = 320
+    for end in range(chunk_size, len(markdown) + chunk_size, chunk_size):
+        if control is not None:
+            while control.paused.is_set() and not control.cancelled.is_set():
+                await asyncio.sleep(0.08)
+            if control.cancelled.is_set():
+                return
+        partial = markdown[:min(end, len(markdown))]
+        yield {"event": "token", "data": {
+            "page_num": page_num, "text": partial, "markdown": partial,
+            "tokens": max(1, len(partial) // 4),
+            "done": end >= len(markdown), "source": "native", "truncated": False,
+        }}
+        await asyncio.sleep(0.025)
+
+    session.page_results[page_num] = {
+        "detections": detections, "html": html, "raw": native_text,
+        "markdown": markdown, "blocks": blocks,
+        "truncated": False, "source": "native",
+    }
+    for i, det in enumerate(detections):
+        yield {"event": "det_result", "data": {
+            "page_num": page_num, "det_index": i,
+            "detection": det, "html": ocr_parser.generate_det_html(det, i),
+            "total_detections": len(detections),
+        }}
+    yield {"event": "page_done", "data": {
+        "page_num": page_num, "html": html, "markdown": markdown,
+        "source": "native", "truncated": False,
+    }}
+    yield {"event": "page_image", "data": {
+        "page_num": page_num,
+        "image_url": f"/api/page-image/{session.session_id}/{page_num}",
+    }}
+
+
+async def _stream_hybrid_page(session, page_num, control, max_length, engine,
+                              native_page, native_text, native_chars):
+    """Stream events for a page using region-level Hybrid OCR (Issue 5).
+
+    Until hybrid_ocr lands, degrade to the native text layer so the route is
+    safe to select and retry behaves predictably.
+    """
+    async for ev in _stream_native_page(session, page_num, control, native_page, native_text):
+        yield ev
+
+
+async def _stream_vlm_page(session, page_num, control, max_length, engine,
+                           native_text, native_chars):
+    """Stream events for a page recognized by the visual OCR model."""
+    img_path = str(session.page_images[page_num - 1])
+    session_id = session.session_id
+    page_truncated = False
+    if hasattr(engine, "ocr_page_stream"):
+        stream = engine.ocr_page_stream(img_path, max_length)
+        raw = ""
+        stable_markdown = ""
+        while True:
+            if control is not None:
+                while control.paused.is_set() and not control.cancelled.is_set():
+                    await asyncio.sleep(0.08)
+                if control.cancelled.is_set():
+                    stream.close()
+                    return
+            done, item = await asyncio.to_thread(_next_stream_item, stream)
+            if done:
+                break
+            raw = item["text"]
+            if item.get("done"):
+                page_truncated = bool(item.get("truncated", False))
+            live_markdown = ocr_parser.raw_to_markdown(raw, session_id, page_num)
+            # The converted tokenizer can briefly decode the first few snapshots
+            # as one repeated phrase, then replace the whole prefix. Never
+            # animate that visibly unstable draft.
+            if item.get("done") or not ocr_parser.is_repetitive_stream_artifact(live_markdown):
+                stable_markdown = live_markdown
+            yield {"event": "token", "data": {
+                "page_num": page_num, "text": raw, "markdown": stable_markdown,
+                "tokens": item.get("tokens", 0),
+                "done": item.get("done", False),
+                "truncated": item.get("truncated", False),
+                "stats": item.get("stats"),
+            }}
+    else:
+        raw = await asyncio.to_thread(engine.ocr_page, img_path, max_length)
+
+    # If a sparse digital page makes the visual model terminate implausibly
+    # early, retain the complete native text instead.
+    generated_markdown = ocr_parser.raw_to_markdown(raw, session_id, page_num)
+    if native_chars >= 120 and len(re.sub(r"\s+", "", generated_markdown)) < native_chars * 0.35:
+        raw = native_text
+        markdown = ocr_parser.native_text_to_markdown(native_text)
+        detections = ocr_parser.native_text_to_detections(native_text)
+        source = "vlm"  # page ran via VLM; content came from the native layer
+    else:
+        markdown = generated_markdown
+        detections = ocr_parser.parse_ocr_output(raw)
+        source = "vlm"
+    for det in detections:
+        det.setdefault("source", source)
+
+    yield {"event": "page_progress", "data": {"page_num": page_num, "status": "parsing"}}
+
+    blocks = ocr_parser.reconstruct_structure(detections)
+    html = ocr_parser.generate_html(detections, page_num)
+    session.page_results[page_num] = {
+        "detections": detections, "html": html, "raw": raw,
+        "markdown": markdown, "blocks": blocks,
+        "truncated": page_truncated, "source": source,
+    }
+    for i, det in enumerate(detections):
+        yield {"event": "det_result", "data": {
+            "page_num": page_num, "det_index": i,
+            "detection": det, "html": ocr_parser.generate_det_html(det, i),
+            "total_detections": len(detections),
+        }}
+    yield {"event": "page_done", "data": {
+        "page_num": page_num, "html": html, "markdown": markdown,
+        "truncated": page_truncated, "source": source,
+    }}
+    yield {"event": "page_image", "data": {
+        "page_num": page_num, "image_url": f"/api/page-image/{session_id}/{page_num}",
+    }}
+
+
+async def process_page(
+    session: SessionData,
+    page_num: int,
+    control: Optional[ScanControl] = None,
+    max_length: int = DEFAULT_MAX_LENGTH,
+    force_mode: Optional[str] = None,
+    engine=None,
+):
+    """Process a single page end-to-end, yielding internal events.
+
+    Events are {"event": str, "data": dict} and are shared by /api/scan and
+    /api/scan-page so retries use the exact same OCR flow. Updates
+    session.page_status and session.page_results. Page-level failures never
+    raise: they are recorded as state=failed and surfaced as an "error" event
+    so a long scan keeps going.
+    """
+    engine = engine or _resolve_engine()
+    status = session.page_status.setdefault(page_num, {"state": "pending", "error": None, "attempts": 0})
+    status["attempts"] = int(status.get("attempts", 0)) + 1
+    status["state"] = "processing"
+    status["error"] = None
+    print(f"[ocr] page={page_num} attempt={status['attempts']}")
+    yield {"event": "page_start", "data": {
+        "page_num": page_num, "total_pages": session.total_pages, "attempt": status["attempts"],
+    }}
+    yield {"event": "page_progress", "data": {"page_num": page_num, "status": "scanning"}}
+
+    try:
+        native_text = session.native_page_texts[page_num - 1] if page_num <= len(session.native_page_texts) else ""
+        native_page = session.native_pages[page_num - 1] if page_num <= len(session.native_pages) else {}
+        native_chars = len(re.sub(r"\s+", "", native_text))
+        route = _route_page(native_page, native_chars, force_mode)
+        print(f"[router] page={page_num} route={route}")
+        if route == "native":
+            async for ev in _stream_native_page(session, page_num, control, native_page, native_text):
+                yield ev
+        elif route == "hybrid":
+            async for ev in _stream_hybrid_page(session, page_num, control, max_length, engine,
+                                                native_page, native_text, native_chars):
+                yield ev
+        else:
+            async for ev in _stream_vlm_page(session, page_num, control, max_length, engine,
+                                             native_text, native_chars):
+                yield ev
+
+        if control is not None and control.cancelled.is_set():
+            status["state"] = "cancelled"
+            return
+        result = session.page_results.get(page_num) or {}
+        status["state"] = "warning" if result.get("truncated") else "done"
+        result["status"] = status["state"]
+    except Exception as exc:
+        status["state"] = "failed"
+        status["error"] = str(exc)
+        session.page_results[page_num] = {
+            "status": "failed", "error": str(exc),
+            "detections": [], "html": "", "markdown": "", "blocks": [], "raw": "",
+            "truncated": False,
+        }
+        print(f"[ocr] page={page_num} failed error={exc}")
+        yield {"event": "error", "data": {"page_num": page_num, "message": str(exc)}}
+
+
 @app.post("/api/scan")
 async def scan(request: Request):
     """SSE endpoint: stream generated tokens, then structured page results."""
     body = await request.json()
     session_id = body.get("session_id")
-    max_length = body.get("max_length", 8192)
+    max_length = int(body.get("max_length", DEFAULT_MAX_LENGTH))
 
     session = sessions.get(session_id)
     if not session:
@@ -211,148 +433,41 @@ async def scan(request: Request):
                 if control.cancelled.is_set():
                     stopped = True
                     break
-                yield _sse("page_start", {"page_num": page_num, "total_pages": session.total_pages})
-                yield _sse("page_progress", {"page_num": page_num, "status": "scanning"})
-
-                img_path = str(session.page_images[page_num - 1])
-                native_text = session.native_page_texts[page_num - 1] if page_num <= len(session.native_page_texts) else ""
-                native_page = session.native_pages[page_num - 1] if page_num <= len(session.native_pages) else {}
-                native_chars = len(re.sub(r"\s+", "", native_text))
-
-                # A usable digital PDF text layer is both faster and more exact.
-                # Native layout extraction restores tables and vector figures;
-                # genuinely scanned pages still use the visual OCR model.
-                if native_chars >= 120:
-                    markdown = native_page.get("markdown") or ocr_parser.native_text_to_markdown(native_text)
-                    detections = native_page.get("detections") or ocr_parser.native_text_to_detections(native_text)
-                    blocks = ocr_parser.reconstruct_structure(detections)
-                    html = ocr_parser.generate_html(detections, page_num)
-                    chunk_size = 320
-                    for end in range(chunk_size, len(markdown) + chunk_size, chunk_size):
-                        while control.paused.is_set() and not control.cancelled.is_set():
-                            await asyncio.sleep(0.08)
-                        if control.cancelled.is_set():
-                            stopped = True
-                            break
-                        partial = markdown[:min(end, len(markdown))]
-                        yield _sse("token", {
-                            "page_num": page_num,
-                            "text": partial,
-                            "markdown": partial,
-                            "tokens": max(1, len(partial) // 4),
-                            "done": end >= len(markdown),
-                            "source": "pdf_text",
-                        })
-                        await asyncio.sleep(0.025)
-                    if stopped:
-                        break
-                    session.page_results[page_num] = {
-                        "detections": detections, "html": html, "raw": native_text,
-                        "markdown": markdown, "blocks": blocks,
-                        "truncated": False,
-                    }
-                    for i, det in enumerate(detections):
-                        yield _sse("det_result", {
-                            "page_num": page_num, "det_index": i,
-                            "detection": det, "html": ocr_parser.generate_det_html(det, i),
-                            "total_detections": len(detections),
-                        })
-                    yield _sse("page_done", {
-                        "page_num": page_num, "html": html, "markdown": markdown,
-                        "source": "pdf_text", "truncated": False,
-                    })
-                    yield _sse("page_image", {
-                        "page_num": page_num,
-                        "image_url": f"/api/page-image/{session_id}/{page_num}",
-                    })
-                    continue
-
-                page_truncated = False
-                try:
-                    if hasattr(ocr_engine, "ocr_page_stream"):
-                        stream = ocr_engine.ocr_page_stream(img_path, max_length)
-                        raw = ""
-                        stable_markdown = ""
-                        while True:
-                            while control.paused.is_set() and not control.cancelled.is_set():
-                                await asyncio.sleep(0.08)
-                            if control.cancelled.is_set():
-                                stream.close()
-                                stopped = True
-                                break
-                            done, item = await asyncio.to_thread(_next_stream_item, stream)
-                            if done:
-                                break
-                            raw = item["text"]
-                            if item.get("done"):
-                                page_truncated = bool(item.get("truncated", False))
-                            live_markdown = ocr_parser.raw_to_markdown(raw, session_id, page_num)
-                            # The converted tokenizer can briefly decode the first
-                            # few snapshots as one repeated phrase, then replace the
-                            # whole prefix. Never animate that visibly unstable draft.
-                            if item.get("done") or not ocr_parser.is_repetitive_stream_artifact(live_markdown):
-                                stable_markdown = live_markdown
-                            yield _sse("token", {
-                                "page_num": page_num,
-                                "text": raw,
-                                "markdown": stable_markdown,
-                                "tokens": item.get("tokens", 0),
-                                "done": item.get("done", False),
-                                "truncated": item.get("truncated", False),
-                                "stats": item.get("stats"),
-                            })
-                    else:
-                        raw = await asyncio.to_thread(ocr_engine.ocr_page, img_path, max_length)
-                except Exception as e:
-                    if control.cancelled.is_set():
-                        stopped = True
-                        break
-                    yield _sse("error", {"page_num": page_num, "message": str(e)})
-                    continue
-
-                if stopped:
-                    break
-
-                # If a sparse digital page makes the visual model terminate
-                # implausibly early, retain the complete native text instead.
-                generated_markdown = ocr_parser.raw_to_markdown(raw, session_id, page_num)
-                if native_chars >= 120 and len(re.sub(r"\s+", "", generated_markdown)) < native_chars * 0.35:
-                    raw = native_text
-                    markdown = ocr_parser.native_text_to_markdown(native_text)
-                    detections = ocr_parser.native_text_to_detections(native_text)
-                else:
-                    markdown = generated_markdown
-                    detections = ocr_parser.parse_ocr_output(raw)
-
-                yield _sse("page_progress", {"page_num": page_num, "status": "parsing"})
-
-                blocks = ocr_parser.reconstruct_structure(detections)
-
-            # Store full results
-                html = ocr_parser.generate_html(detections, page_num)
-                session.page_results[page_num] = {
-                    "detections": detections, "html": html, "raw": raw,
-                    "markdown": markdown, "blocks": blocks,
-                    "truncated": page_truncated,
-                }
-
-            # Push each detection line one by one for real-time display
-                for i, det in enumerate(detections):
-                    det_html = ocr_parser.generate_det_html(det, i)
-                    yield _sse("det_result", {
-                        "page_num": page_num, "det_index": i,
-                        "detection": det, "html": det_html,
-                        "total_detections": len(detections),
-                    })
-
-                yield _sse("page_done", {"page_num": page_num, "html": html, "markdown": markdown, "truncated": page_truncated})
-                yield _sse("page_image", {"page_num": page_num, "image_url": f"/api/page-image/{session_id}/{page_num}"})
-
+                async for ev in process_page(session, page_num, control=control, max_length=max_length):
+                    yield _sse(ev["event"], ev["data"])
+            states = [s.get("state") for s in session.page_status.values()]
             yield _sse("scan_stopped" if stopped else "scan_complete", {
-                "session_id": session_id, "total_pages": session.total_pages
+                "session_id": session_id,
+                "total_pages": session.total_pages,
+                "done_pages": sum(1 for s in states if s in ("done", "warning")),
+                "failed_pages": sum(1 for s in states if s == "failed"),
             })
         finally:
             scan_controls.pop(session_id, None)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@app.post("/api/scan-page/{session_id}/{page_num}")
+async def scan_page(session_id: str, page_num: int, request: Request):
+    """Retry a single page, streaming the same SSE events as /api/scan.
+
+    Request body: {"max_length": 8192, "force_mode": "native"|"hybrid"|"vlm"|null}
+    """
+    session = sessions.get(session_id)
+    if not session:
+        return JSONResponse({"error": "Session not found"}, status_code=404)
+    if page_num < 1 or page_num > session.total_pages:
+        return JSONResponse({"error": "Page out of range"}, status_code=404)
+    body = await request.json()
+    max_length = int(body.get("max_length", DEFAULT_MAX_LENGTH))
+    force_mode = body.get("force_mode") or None
+    if force_mode not in (None, "native", "hybrid", "vlm"):
+        return JSONResponse({"error": f"Invalid force_mode: {force_mode}"}, status_code=400)
+
+    async def event_generator():
+        async for ev in process_page(session, page_num, max_length=max_length, force_mode=force_mode):
+            yield _sse(ev["event"], ev["data"])
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
