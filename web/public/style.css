@@ -26,3 +26,10 @@ svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.8;stroke
 .view-switch button,.result-actions .mini-btn{white-space:nowrap;flex:none}.view-switch button{min-width:38px}.result-actions #translate-btn{min-width:44px}.result-actions #copy-btn{min-width:48px}
 #export-menu-btn[aria-expanded="true"] + .export-menu-list{opacity:1;visibility:visible;pointer-events:auto;transform:none}
 .export-menu{position:relative}.export-menu-list{position:absolute;top:calc(100% + 4px);right:0;min-width:140px;padding:5px;background:var(--surface);border:1px solid var(--border);border-radius:9px;box-shadow:var(--shadow);opacity:0;visibility:hidden;pointer-events:none;transform:translateY(-4px);transition:.14s;z-index:200}.export-menu-btn[aria-expanded="true"] + .export-menu-list{opacity:1;visibility:visible;pointer-events:auto;transform:none}.export-menu-list button{width:100%;height:32px;padding:0 10px;border:0;border-radius:6px;background:transparent;color:var(--text);text-align:left;font:inherit;font-size:12px;cursor:pointer}.export-menu-list button:hover{background:var(--accent-soft);color:var(--accent)}.export-menu-list small{float:right;color:var(--muted);font-size:10px}.menu-chevron{font-size:15px;line-height:1;margin-left:-2px}
+
+/* ── Page truncation warning + thumbnail states (Issue 2/3) ── */
+.page-warning{display:flex;align-items:center;gap:8px;margin:8px 12px 0;padding:8px 12px;border:1px solid var(--warning);border-radius:8px;background:color-mix(in srgb,var(--warning) 12%,transparent);color:var(--warning);font-size:13px;line-height:1.4}.page-warning svg{width:16px;height:16px;flex:none}.page-warning.hidden{display:none}
+.page-item.warning .page-item-meta span{color:var(--warning)}
+.page-item.failed .page-item-meta span{color:var(--danger)}
+.page-item.warning .page-thumb{outline:2px solid var(--warning)}
+.page-item.failed .page-thumb{outline:2px solid var(--danger)}

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="light dark">
   <title>Unlimited OCR · 文档工作台</title>
-  <link rel="stylesheet" href="/static/style.css?v=54">
+  <link rel="stylesheet" href="/static/style.css?v=55">
 </head>
 <body>
   <div class="app-shell">
@@ -138,6 +138,10 @@
             </button>
           </div>
         </div>
+        <div id="page-warning" class="page-warning hidden" role="alert">
+          <svg viewBox="0 0 24 24"><path d="M12 3 2.5 20h19L12 3z"/><path d="M12 10v5M12 18h.01"/></svg>
+          <span id="page-warning-text">本页达到 OCR 最大生成长度，结果可能不完整</span>
+        </div>
         <div id="ocr-content" class="ocr-content">
           <div class="result-empty">
             <div class="result-empty-icon"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h10M4 18h13"/></svg></div>
@@ -171,6 +175,6 @@
     };
   </script>
   <script src="/static/vendor/tex-svg.js"></script>
-  <script src="/static/app.js?v=54"></script>
+  <script src="/static/app.js?v=55"></script>
 </body>
 </html>

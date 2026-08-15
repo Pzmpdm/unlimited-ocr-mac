@@ -5,7 +5,7 @@ import threading
 import time
 from pathlib import Path
 
-from config import OCR_REPO_DIR
+from config import OCR_REPO_DIR, OCR_MAX_TOKENS
 
 MODEL_DIR = Path(
     __import__("os").environ.get(
@@ -104,6 +104,30 @@ def _sliding_no_repeat_ngram(ngram_size: int = 35, window: int = 128):
     return processor
 
 
+def resolve_max_tokens(requested_tokens, ocr_max_tokens=OCR_MAX_TOKENS) -> int:
+    """Effective per-page generation cap.
+
+    The caller may ask for more than the configured cap (e.g. 12000 for a
+    dense page); generation is clamped to ocr_max_tokens. Never below 128 so
+    a tiny request cannot starve the decoder.
+    """
+    requested = max(0, int(requested_tokens))
+    return max(128, min(requested, int(ocr_max_tokens)))
+
+
+def compute_truncation(token_ids, max_tokens, stop_reason=None) -> bool:
+    """Decide whether generation hit the token cap.
+
+    When the backend exposes a stop reason, "length" means the cap was hit.
+    Without a reliable stop reason we fall back to a conservative check
+    (len(token_ids) >= max_tokens), which may over-report but never hides a
+    real truncation.
+    """
+    if stop_reason is not None:
+        return stop_reason == "length"
+    return len(token_ids) >= max_tokens
+
+
 def ocr_page_stream(image_path: str, max_length: int = 2048):
     """Yield progressively decoded OCR snapshots and a final statistics item."""
     global _last_stats
@@ -114,7 +138,7 @@ def ocr_page_stream(image_path: str, max_length: int = 2048):
     token_ids = []
     last = None
     started_at = time.time()
-    max_tokens = max(128, min(int(max_length), 4096))
+    max_tokens = resolve_max_tokens(max_length, OCR_MAX_TOKENS)
 
     # A single model instance must not run two Metal generations concurrently.
     with _inference_lock:
@@ -147,14 +171,25 @@ def ocr_page_stream(image_path: str, max_length: int = 2048):
 
     text = _clean_generated_text(decoder, token_ids)
     elapsed = time.time() - started_at
+    stop_reason = getattr(last, "stop_reason", None)
+    truncated = compute_truncation(token_ids, max_tokens, stop_reason)
     _last_stats = {
         "seconds": round(elapsed, 2),
         "tokens": len(token_ids),
         "tokens_per_second": round(last.generation_tps, 1) if last else None,
         "peak_memory_gb": round(last.peak_memory, 2) if last else None,
+        "max_tokens": max_tokens,
+        "stop_reason": stop_reason,
+        "truncated": truncated,
     }
     print(f"[ocr_engine_mlx] page finished: {_last_stats}")
-    yield {"text": text, "tokens": len(token_ids), "done": True, "stats": _last_stats}
+    yield {
+        "text": text,
+        "tokens": len(token_ids),
+        "done": True,
+        "truncated": truncated,
+        "stats": _last_stats,
+    }
 
 
 def ocr_page(image_path: str, max_length: int = 2048) -> str:

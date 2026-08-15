@@ -21,6 +21,10 @@ DEFAULT_BASE_SIZE = 1024
 DEFAULT_IMAGE_SIZE = 640
 PDF_DPI = 200
 
+# Hard cap for generated tokens per page. A request can ask for more
+# (e.g. 12000 for a dense page) but generation is clamped here.
+OCR_MAX_TOKENS = int(os.getenv("OCR_MAX_TOKENS", "8192"))
+
 # Translation (OpenAI-compatible API)
 TRANSLATE_API_BASE = os.environ.get("TRANSLATE_API_BASE", "")
 TRANSLATE_API_KEY = os.environ.get("TRANSLATE_API_KEY", "")

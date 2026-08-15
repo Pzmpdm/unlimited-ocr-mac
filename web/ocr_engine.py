@@ -67,3 +67,28 @@ def ocr_page(image_path: str, max_length: int = 8192) -> str:
         save_results=False,
     )
     return result or ""
+
+
+def ocr_page_stream(image_path: str, max_length: int = 8192):
+    """Compatibility streaming wrapper for the PyTorch/MPS backend.
+
+    model.infer(eval_mode=True) returns the full string at once, so this
+    yields a single item. The PyTorch path applies no hidden token cap and
+    cannot observe a stop reason, so truncated is reported as False.
+    """
+    text = ocr_page(image_path, max_length)
+    yield {
+        "text": text,
+        "tokens": 0,
+        "done": True,
+        "truncated": False,
+        "stats": {
+            "seconds": None,
+            "tokens": 0,
+            "tokens_per_second": None,
+            "peak_memory_gb": None,
+            "max_tokens": int(max_length),
+            "stop_reason": "eval_mode",
+            "truncated": False,
+        },
+    }

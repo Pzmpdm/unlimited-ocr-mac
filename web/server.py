@@ -249,6 +249,7 @@ async def scan(request: Request):
                     session.page_results[page_num] = {
                         "detections": detections, "html": html, "raw": native_text,
                         "markdown": markdown, "blocks": blocks,
+                        "truncated": False,
                     }
                     for i, det in enumerate(detections):
                         yield _sse("det_result", {
@@ -258,7 +259,7 @@ async def scan(request: Request):
                         })
                     yield _sse("page_done", {
                         "page_num": page_num, "html": html, "markdown": markdown,
-                        "source": "pdf_text",
+                        "source": "pdf_text", "truncated": False,
                     })
                     yield _sse("page_image", {
                         "page_num": page_num,
@@ -266,6 +267,7 @@ async def scan(request: Request):
                     })
                     continue
 
+                page_truncated = False
                 try:
                     if hasattr(ocr_engine, "ocr_page_stream"):
                         stream = ocr_engine.ocr_page_stream(img_path, max_length)
@@ -282,6 +284,8 @@ async def scan(request: Request):
                             if done:
                                 break
                             raw = item["text"]
+                            if item.get("done"):
+                                page_truncated = bool(item.get("truncated", False))
                             live_markdown = ocr_parser.raw_to_markdown(raw, session_id, page_num)
                             # The converted tokenizer can briefly decode the first
                             # few snapshots as one repeated phrase, then replace the
@@ -294,6 +298,7 @@ async def scan(request: Request):
                                 "markdown": stable_markdown,
                                 "tokens": item.get("tokens", 0),
                                 "done": item.get("done", False),
+                                "truncated": item.get("truncated", False),
                                 "stats": item.get("stats"),
                             })
                     else:
@@ -328,6 +333,7 @@ async def scan(request: Request):
                 session.page_results[page_num] = {
                     "detections": detections, "html": html, "raw": raw,
                     "markdown": markdown, "blocks": blocks,
+                    "truncated": page_truncated,
                 }
 
             # Push each detection line one by one for real-time display
@@ -339,7 +345,7 @@ async def scan(request: Request):
                         "total_detections": len(detections),
                     })
 
-                yield _sse("page_done", {"page_num": page_num, "html": html, "markdown": markdown})
+                yield _sse("page_done", {"page_num": page_num, "html": html, "markdown": markdown, "truncated": page_truncated})
                 yield _sse("page_image", {"page_num": page_num, "image_url": f"/api/page-image/{session_id}/{page_num}"})
 
             yield _sse("scan_stopped" if stopped else "scan_complete", {

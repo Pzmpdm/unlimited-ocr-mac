@@ -264,9 +264,9 @@ async function startScan() {
     const r = await fetch('/api/scan', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      // Dense pages can exceed 2K tokens; truncating mid-detection leaves
-      // grounding fragments in the final document. MLX caps this at 4096.
-      body: JSON.stringify({ session_id: state.sessionId, max_length: 4096 }),
+      // Ask for the full configured cap; the backend clamps to OCR_MAX_TOKENS
+      // and reports truncation per page when the cap is hit.
+      body: JSON.stringify({ session_id: state.sessionId, max_length: 8192 }),
       signal: state.scanAbortController.signal,
     });
 
@@ -366,6 +366,7 @@ function handleSSEChunk(chunk) {
       if (!state.pageResults[data.page_num]) state.pageResults[data.page_num] = { detections: [] };
       state.pageResults[data.page_num].raw = data.text;
       state.pageResults[data.page_num].markdown = data.markdown;
+      if (data.truncated) state.pageResults[data.page_num].truncated = true;
       if (!state.scanStopped && state.resultMode === 'markdown' && data.page_num === state.currentPage) {
         updateTypewriterTarget(data.markdown, Boolean(data.done), data.page_num);
       }
@@ -379,12 +380,14 @@ function handleSSEChunk(chunk) {
         detections: state.pageResults[data.page_num]?.detections || [],
         html: data.html,
         markdown: data.markdown,
+        truncated: Boolean(data.truncated),
       };
       if (!state.scanStopped && data.page_num === state.currentPage) {
         if (state.resultMode === 'markdown') updateTypewriterTarget(data.markdown, true, data.page_num);
         else renderOCRContent(data.html);
+        updatePageWarning();
       }
-      setPageStatus(data.page_num, 'done');
+      setPageStatus(data.page_num, data.truncated ? 'warning' : 'done');
       updateResultStats(data.page_num);
       break;
 
@@ -735,6 +738,7 @@ function goToPage(num, manual = true) {
   } else {
     ocrContent.innerHTML = emptyResult('此页尚未识别', '点击「开始识别」后结果会显示在这里');
   }
+  updatePageWarning();
   updateResultStats(num);
 }
 
@@ -1029,8 +1033,24 @@ function setPageStatus(page, status) {
   const item = pageList.querySelector(`[data-page="${page}"]`);
   if (!item) return;
   item.classList.toggle('done', status === 'done');
+  item.classList.toggle('warning', status === 'warning');
+  item.classList.toggle('failed', status === 'failed');
   const label = item.querySelector('.page-item-meta span');
-  label.textContent = status === 'done' ? '识别完成' : status === 'scanning' ? '正在识别…' : '等待识别';
+  label.textContent =
+    status === 'done' ? '识别完成'
+    : status === 'warning' ? '结果可能不完整'
+    : status === 'failed' ? '识别失败'
+    : status === 'scanning' ? '正在识别…' : '等待识别';
+}
+
+// Persistent truncation warning banner that follows the page result.
+function updatePageWarning() {
+  const warning = $('page-warning');
+  if (!warning) return;
+  const result = state.pageResults[state.currentPage];
+  const show = Boolean(result && result.truncated);
+  warning.classList.toggle('hidden', !show);
+  if (show) $('page-warning-text').textContent = '⚠ 本页达到 OCR 最大生成长度，结果可能不完整';
 }
 
 function setupDropZone() {
