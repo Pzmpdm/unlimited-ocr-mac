@@ -201,16 +201,21 @@ def _resolve_engine():
 def _route_page(native_page: dict, native_chars: int, force_mode: Optional[str] = None) -> str:
     """Choose native / hybrid / vlm for a page.
 
-    Issue 4 replaces this heuristic with page_router.choose_page_route; until
-    then it keeps the historical native_chars >= 120 behaviour so the page
-    status / retry work can land independently.
+    Uses page_router.choose_page_route on the page analysis produced by
+    pdf_converter.extract_native_page. When no analysis is available (e.g.
+    legacy sessions), falls back to the historical native_chars >= 120
+    heuristic so behaviour stays predictable.
     """
+    from page_router import PageAnalysis, choose_page_route
+
     if force_mode in ("native", "hybrid", "vlm"):
-        if force_mode == "hybrid":
-            # Hybrid lands with Issue 5; until then it behaves like native.
-            return "native"
         return force_mode
-    return "native" if native_chars >= 120 else "vlm"
+    analysis = native_page.get("analysis") if isinstance(native_page, dict) else None
+    if analysis:
+        page_analysis = PageAnalysis.from_dict(analysis)
+    else:
+        page_analysis = PageAnalysis(text_chars=native_chars)
+    return choose_page_route(page_analysis)
 
 
 async def _stream_native_page(session, page_num, control, native_page, native_text):

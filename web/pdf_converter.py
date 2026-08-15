@@ -132,40 +132,69 @@ def extract_native_pages(pdf_path: str, session_id: str = "") -> list[dict]:
 
 
 def extract_native_page(doc, page_num: int, session_id: str = "") -> dict:
-    """Extract one page's text, Markdown, tables and figure regions."""
+    """Extract one page's text, Markdown, tables, figure regions and analysis."""
     page = doc[page_num - 1]
     text = _normalize_private_use_text(page.get_text("text", sort=True)).strip()
-    lines = _page_lines(page)
-    # ``find_tables`` is cheap enough (~0.07 s/page) to run on every non-blank
+    lines, text_blocks = _page_lines_and_block_count(page)
+    # find_tables is cheap enough (~0.07 s/page) to run on every non-blank
     # page; only skip genuinely empty pages that carry neither text nor images.
     # The same table boxes are reused for figure detection so that table ruling
     # lines are never mistaken for figure graphics.
     found_tables = _find_tables(page)
+    stats: dict = {}
     if len(text) >= 60 or page.get_images():
-        figures = _figure_regions(lines, page, found_tables)
+        figures = _figure_regions(lines, page, found_tables, stats=stats)
         figure_boxes = [figure["bbox"] for figure in figures]
-        tables = _extract_tables(page, figure_boxes, found_tables)
+        tables = _extract_tables(
+            page, figure_boxes, found_tables, drawings=stats.get("drawings")
+        )
     else:
         figures = []
         tables = []
     markdown, detections = _native_layout_markdown(
         lines, tables, figures, page.rect, session_id, page_num
     )
+    # Page-quality analysis for the native/hybrid/vlm router. Every field
+    # reuses data already computed above (image/drawing stats are captured
+    # inside _figure_regions), so the router adds no per-page cost.
+    from page_router import estimate_column_count, suspicious_character_ratio
+
+    analysis = {
+        "text_chars": len(re.sub(r"\s+", "", text)),
+        "text_blocks": text_blocks,
+        "image_count": stats.get("image_count", 0),
+        "image_coverage": stats.get("image_coverage", 0.0),
+        "drawing_count": stats.get("drawing_count", 0),
+        "table_count": len(tables),
+        "figure_count": len(figures),
+        "suspicious_char_ratio": suspicious_character_ratio(text),
+        "column_count": estimate_column_count(lines),
+        "native_markdown_chars": len(re.sub(r"\s+", "", markdown)),
+    }
     return {
         "text": text,
         "markdown": markdown,
         "detections": detections,
         "tables": len(tables),
         "figures": len(figures),
+        "analysis": analysis,
     }
 
 
 def _page_lines(page) -> list[dict]:
+    lines, _ = _page_lines_and_block_count(page)
+    return lines
+
+
+def _page_lines_and_block_count(page) -> tuple[list[dict], int]:
+    """Return (text lines, count of non-empty text blocks) in a single pass."""
     lines = []
+    block_count = 0
     page_dict = page.get_text("dict", sort=True)
     for block in page_dict.get("blocks", []):
         if block.get("type") != 0:
             continue
+        block_has_text = False
         for line in block.get("lines", []):
             spans = []
             for span in line.get("spans", []):
@@ -183,13 +212,16 @@ def _page_lines(page) -> list[dict]:
             text = _join_span_texts(spans)
             if not text:
                 continue
+            block_has_text = True
             lines.append({
                 "text": text,
                 "bbox": tuple(line.get("bbox", (0, 0, 0, 0))),
                 "size": max((float(span.get("size", 0)) for span in line.get("spans", [])), default=0),
                 "bold": any("bold" in span.get("font", "").lower() for span in line.get("spans", [])),
             })
-    return sorted(lines, key=lambda line: (round(line["bbox"][1], 1), line["bbox"][0]))
+        if block_has_text:
+            block_count += 1
+    return sorted(lines, key=lambda line: (round(line["bbox"][1], 1), line["bbox"][0])), block_count
 
 
 def _page_spans(page) -> list[dict]:
@@ -640,7 +672,8 @@ def _is_bit_pattern_table(table) -> bool:
 
 
 def _extract_tables(page, skip_boxes: list[tuple] | None = None,
-                    found: list | None = None) -> list[dict]:
+                    found: list | None = None,
+                    drawings: list | None = None) -> list[dict]:
     tables = []
     if found is None:
         found = _find_tables(page)
@@ -648,7 +681,8 @@ def _extract_tables(page, skip_boxes: list[tuple] | None = None,
         return tables
 
     spans = _page_spans(page)
-    drawings = page.get_drawings()
+    if drawings is None:
+        drawings = page.get_drawings()
     for table in found:
         x0, y0, x1, y1 = table.bbox
         # A page-header band is a short 1-row box at the very top; a genuine
@@ -899,17 +933,35 @@ def _convert_math_blocks(markdown: str, page_num: int) -> str:
     return markdown
 
 
-def _figure_regions(lines: list[dict], page, found_tables: list | None = None) -> list[dict]:
+def _figure_regions(lines: list[dict], page, found_tables: list | None = None,
+                    stats: dict | None = None) -> list[dict]:
     page_rect = page.rect
     page_text = _normalize_private_use_text(page.get_text("text", sort=True))
     if re.search(r"^\s*List\s+of\s+figures\s*$", page_text, re.M | re.I):
         return []
     page_images = page.get_image_info()
+    if stats is not None:
+        rect = page.rect
+        page_area = max(1.0, rect.width * rect.height)
+        coverage = 0.0
+        for info in page_images:
+            bbox = info.get("bbox")
+            if not bbox or len(bbox) < 4:
+                continue
+            x0, y0, x1, y1 = bbox
+            w = max(0.0, min(x1, rect.x1) - max(x0, rect.x0))
+            h = max(0.0, min(y1, rect.y1) - max(y0, rect.y0))
+            coverage += (w * h) / page_area
+        stats["image_count"] = len(page_images)
+        stats["image_coverage"] = min(1.0, coverage)
     image_tops = [
         (info["bbox"][1], info["bbox"][3] - info["bbox"][1])
         for info in page_images
     ]
     page_drawings = page.get_drawings()
+    if stats is not None:
+        stats["drawing_count"] = len(page_drawings)
+        stats["drawings"] = page_drawings
     genuine_boxes = []
     for table in (found_tables or []):
         if not _is_genuine_table(table):
