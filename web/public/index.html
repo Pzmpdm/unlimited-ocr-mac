@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="color-scheme" content="light dark">
   <title>Unlimited OCR · 文档工作台</title>
-  <link rel="stylesheet" href="/static/style.css?v=57">
+  <link rel="stylesheet" href="/static/style.css?v=58">
 </head>
 <body>
   <div class="app-shell">
@@ -96,7 +96,10 @@
           </div>
         </div>
         <div id="source-view" class="source-view">
-          <img id="source-image" alt="文档页面预览">
+          <div class="source-canvas" id="source-canvas">
+            <img id="source-image" alt="文档页面预览">
+            <div id="bbox-overlay"></div>
+          </div>
           <div id="source-placeholder" class="empty-state">
             <div class="empty-illustration">
               <svg viewBox="0 0 96 96"><rect x="20" y="12" width="56" height="72" rx="8"/><path d="M32 33h32M32 45h25M32 57h29"/><path d="M68 72l10 10M72 68a10 10 0 1 0 0 20 10 10 0 0 0 0-20z"/></svg>
@@ -175,6 +178,6 @@
     };
   </script>
   <script src="/static/vendor/tex-svg.js"></script>
-  <script src="/static/app.js?v=57"></script>
+  <script src="/static/app.js?v=58"></script>
 </body>
 </html>

@@ -82,6 +82,19 @@ document.addEventListener('DOMContentLoaded', () => {
     const retryBtn = e.target.closest('[data-retry-page]');
     if (retryBtn) retryPage(parseInt(retryBtn.dataset.retryPage, 10));
   });
+  ocrContent.addEventListener('mouseover', e => {
+    const t = e.target.closest('[data-detection-index]');
+    if (t) highlightBbox(t.dataset.detectionIndex, 'hover');
+  });
+  ocrContent.addEventListener('mouseout', e => {
+    if (e.target.closest('[data-detection-index]')) clearBboxHighlight('hover');
+  });
+  ocrContent.addEventListener('click', e => {
+    const t = e.target.closest('[data-detection-index]');
+    if (t) highlightBbox(t.dataset.detectionIndex, 'selected');
+  });
+  const bboxOverlay = $('bbox-overlay');
+  if (bboxOverlay) bboxOverlay.addEventListener('click', handleBboxClick);
   $('markdown-view-btn').addEventListener('click', () => setResultMode('markdown'));
   $('text-view-btn').addEventListener('click', () => setResultMode('text'));
   transLang.addEventListener('change', () => {
@@ -370,6 +383,7 @@ function handleSSEChunk(chunk) {
     case 'det_result':
       // Append this single detection line to the current page container
       appendDetection(data);
+      if (data.page_num === state.currentPage) renderBboxes(data.page_num);
       break;
 
     case 'token':
@@ -402,6 +416,7 @@ function handleSSEChunk(chunk) {
       const pageWarned = Boolean(data.truncated || (data.warnings && data.warnings.length));
       setPageStatus(data.page_num, pageWarned ? 'warning' : 'done');
       updateResultStats(data.page_num);
+      if (data.page_num === state.currentPage) renderBboxes(data.page_num);
       break;
 
     case 'page_image':
@@ -708,6 +723,9 @@ function loadPageImage(pageNum) {
       srcImg.classList.add('loaded');
       srcPlaceholder.style.display = 'none';
       fitImage();
+      const canvas = $('source-canvas');
+      if (canvas) canvas.style.display = 'inline-block';
+      renderBboxes(state.currentPage);
       const fittedPage = getFittedPageSize();
       state.markdownPageSize = { width: fittedPage.width, height: fittedPage.height };
       scheduleMarkdownFit();
@@ -716,6 +734,8 @@ function loadPageImage(pageNum) {
     srcImg.onerror = () => {
       srcImg.classList.remove('loaded');
       srcPlaceholder.style.display = '';
+      const canvas = $('source-canvas');
+      if (canvas) canvas.style.display = 'none';
     };
     srcImg.src = url;
   }
@@ -759,6 +779,7 @@ function goToPage(num, manual = true) {
     ocrContent.innerHTML = emptyResult('此页尚未识别', '点击「开始识别」后结果会显示在这里');
   }
   updatePageWarning();
+  renderBboxes(num);
   updateResultStats(num);
 }
 
@@ -1128,6 +1149,57 @@ async function retryPage(pageNum) {
 
 function escapeHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// ── BBox bidirectional highlighting (Issue 6) ─────────────────
+// Bboxes use percentages of the 1000x1000 normalized space so they track the
+// rendered image exactly while zooming: the overlay is inset:0 over the img
+// inside .source-canvas, which wraps the image at its rendered size.
+function renderBboxes(pageNum) {
+  const overlay = $('bbox-overlay');
+  if (!overlay) return;
+  overlay.innerHTML = '';
+  const result = state.pageResults[pageNum];
+  const detections = result?.detections || [];
+  detections.forEach((det, i) => {
+    const bbox = det.bbox;
+    if (!Array.isArray(bbox) || bbox.length !== 4) return;
+    const [x1, y1, x2, y2] = bbox;
+    const el = document.createElement('div');
+    el.className = 'ocr-bbox';
+    el.dataset.detectionIndex = String(i);
+    el.style.left = `${x1 / 1000 * 100}%`;
+    el.style.top = `${y1 / 1000 * 100}%`;
+    el.style.width = `${(x2 - x1) / 1000 * 100}%`;
+    el.style.height = `${(y2 - y1) / 1000 * 100}%`;
+    overlay.appendChild(el);
+  });
+}
+
+function highlightBbox(index, cls) {
+  const overlay = $('bbox-overlay');
+  if (!overlay) return;
+  overlay.querySelectorAll('.ocr-bbox').forEach(el => el.classList.remove('hover', 'selected'));
+  const el = overlay.querySelector(`.ocr-bbox[data-detection-index="${index}"]`);
+  if (el) el.classList.add(cls);
+}
+
+function clearBboxHighlight(cls) {
+  const overlay = $('bbox-overlay');
+  if (!overlay) return;
+  overlay.querySelectorAll(`.ocr-bbox.${cls}`).forEach(el => el.classList.remove(cls));
+}
+
+function handleBboxClick(e) {
+  const bbox = e.target.closest('.ocr-bbox');
+  if (!bbox) return;
+  const index = bbox.dataset.detectionIndex;
+  const el = ocrContent.querySelector(`[data-detection-index="${index}"]`);
+  if (el) {
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    el.classList.add('right-highlight');
+    setTimeout(() => el.classList.remove('right-highlight'), 1400);
+  }
 }
 
 function setupDropZone() {

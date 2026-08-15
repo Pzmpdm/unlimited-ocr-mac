@@ -37,3 +37,12 @@ svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.8;stroke
 /* ── Page failure card (Issue 3) ── */
 .page-error .page-error-msg{margin:4px 0 12px;color:var(--danger);font-size:13px;word-break:break-word}
 .page-error button{margin-top:4px}
+
+/* ── BBox overlay + bidirectional highlighting (Issue 6) ── */
+.source-canvas{position:relative;display:none;line-height:0}
+.source-canvas img{display:block}
+#bbox-overlay{position:absolute;inset:0;pointer-events:none}
+.ocr-bbox{position:absolute;border:1.5px solid var(--accent);background:color-mix(in srgb,var(--accent) 14%,transparent);border-radius:2px;pointer-events:auto;cursor:pointer;transition:background .12s}
+.ocr-bbox.hover{background:color-mix(in srgb,var(--accent) 34%,transparent);border-color:var(--accent-2)}
+.ocr-bbox.selected{background:color-mix(in srgb,var(--warning) 34%,transparent);border-color:var(--warning)}
+.right-highlight{background:color-mix(in srgb,var(--warning) 20%,transparent)!important;border-radius:4px}
