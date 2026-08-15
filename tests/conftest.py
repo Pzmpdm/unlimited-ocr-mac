@@ -71,13 +71,19 @@ def session_factory(tmp_path):
     """
 
     def _make(n=3, native_texts=None, native_pages=None):
+        from io import BytesIO
+
+        from PIL import Image
         from server import SessionData
 
         upload_dir = tmp_path / "uploads"
         upload_dir.mkdir(parents=True, exist_ok=True)
         page_images = [upload_dir / f"page_{i:04d}.png" for i in range(1, n + 1)]
+        buf = BytesIO()
+        Image.new("RGB", (4, 4), "white").save(buf, "PNG")
+        png_bytes = buf.getvalue()
         for p in page_images:
-            p.write_bytes(b"fake-png")
+            p.write_bytes(png_bytes)
         texts = native_texts if native_texts is not None else ["" for _ in range(n)]
         pages = native_pages if native_pages is not None else [
             {"text": texts[i], "markdown": "", "detections": [], "tables": 0, "figures": 0}

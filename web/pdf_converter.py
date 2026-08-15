@@ -154,6 +154,7 @@ def extract_native_page(doc, page_num: int, session_id: str = "") -> dict:
     markdown, detections = _native_layout_markdown(
         lines, tables, figures, page.rect, session_id, page_num
     )
+    regions = _build_regions(lines, tables, figures, page.rect)
     # Page-quality analysis for the native/hybrid/vlm router. Every field
     # reuses data already computed above (image/drawing stats are captured
     # inside _figure_regions), so the router adds no per-page cost.
@@ -178,6 +179,7 @@ def extract_native_page(doc, page_num: int, session_id: str = "") -> dict:
         "tables": len(tables),
         "figures": len(figures),
         "analysis": analysis,
+        "regions": regions,
     }
 
 
@@ -1245,6 +1247,55 @@ def _normalize_bbox(bbox, page_rect) -> list[int]:
         max(0, min(1000, round((x1 - page_rect.x0) / page_rect.width * 1000))),
         max(0, min(1000, round((y1 - page_rect.y0) / page_rect.height * 1000))),
     ]
+
+
+def _build_regions(lines: list[dict], tables: list[dict], figures: list[dict], page_rect) -> list[dict]:
+    """Build native DocumentRegion records for tables, figures and text lines.
+
+    Regions share the same bbox normalization as detections (0..1000) so the
+    hybrid OCR pipeline can crop them and map VLM output back to page space.
+    """
+    regions = []
+    table_boxes = [table["bbox"] for table in tables]
+    figure_boxes = [figure["bbox"] for figure in figures]
+    for i, table in enumerate(tables):
+        regions.append({
+            "region_id": f"table-{i + 1}",
+            "type": "table",
+            "bbox": tuple(table["bbox"]),
+            "normalized_bbox": _normalize_bbox(table["bbox"], page_rect),
+            "source": "native",
+            "content": table.get("markdown", ""),
+            "confidence": None,
+        })
+    for i, figure in enumerate(figures):
+        regions.append({
+            "region_id": f"figure-{i + 1}",
+            "type": "figure",
+            "bbox": tuple(figure["bbox"]),
+            "normalized_bbox": _normalize_bbox(figure["bbox"], page_rect),
+            "source": "native",
+            "content": figure.get("caption", ""),
+            "confidence": None,
+        })
+    for i, line in enumerate(lines):
+        x0, y0, x1, y1 = line["bbox"]
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        if any(tx0 <= cx <= tx1 and ty0 <= cy <= ty1 for tx0, ty0, tx1, ty1 in table_boxes):
+            continue
+        if any(fx0 <= cx <= fx1 and fy0 <= cy <= fy1 for fx0, fy0, fx1, fy1 in figure_boxes):
+            continue
+        det_type = "title" if _is_heading(line["text"], line["bold"], line["size"]) else "text"
+        regions.append({
+            "region_id": f"text-{i + 1}",
+            "type": det_type,
+            "bbox": tuple(line["bbox"]),
+            "normalized_bbox": _normalize_bbox(line["bbox"], page_rect),
+            "source": "native",
+            "content": line["text"],
+            "confidence": None,
+        })
+    return regions
 
 
 def image_to_base64(image_path: Path) -> str:

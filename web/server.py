@@ -264,13 +264,62 @@ async def _stream_native_page(session, page_num, control, native_page, native_te
 
 async def _stream_hybrid_page(session, page_num, control, max_length, engine,
                               native_page, native_text, native_chars):
-    """Stream events for a page using region-level Hybrid OCR (Issue 5).
+    """Stream events for a page using region-level Hybrid OCR.
 
-    Until hybrid_ocr lands, degrade to the native text layer so the route is
-    safe to select and retry behaves predictably.
+    Body text and good tables stay native; low-quality table regions are
+    cropped and re-OCR'd by the visual model. Region failures degrade to the
+    native region and surface as page warnings (state=warning, not failed).
     """
-    async for ev in _stream_native_page(session, page_num, control, native_page, native_text):
-        yield ev
+    import hybrid_ocr
+
+    if not (native_page or {}).get("regions"):
+        # No region data (legacy session): behave exactly like native.
+        async for ev in _stream_native_page(session, page_num, control, native_page, native_text):
+            yield ev
+        return
+
+    result = await asyncio.to_thread(
+        hybrid_ocr.build_hybrid_result, session, page_num, native_page, engine, max_length
+    )
+    detections = result["detections"]
+    markdown = result["markdown"]
+    html = result["html"]
+    blocks = result["blocks"]
+    warnings = result.get("warnings", [])
+    truncated = bool(result.get("truncated", False))
+    session.page_results[page_num] = {
+        "detections": detections, "html": html, "raw": result.get("raw", ""),
+        "markdown": markdown, "blocks": blocks,
+        "truncated": truncated, "source": "hybrid", "warnings": warnings,
+    }
+    chunk_size = 320
+    for end in range(chunk_size, len(markdown) + chunk_size, chunk_size):
+        if control is not None:
+            while control.paused.is_set() and not control.cancelled.is_set():
+                await asyncio.sleep(0.08)
+            if control.cancelled.is_set():
+                return
+        partial = markdown[:min(end, len(markdown))]
+        yield {"event": "token", "data": {
+            "page_num": page_num, "text": partial, "markdown": partial,
+            "tokens": max(1, len(partial) // 4),
+            "done": end >= len(markdown), "source": "hybrid", "truncated": False,
+        }}
+        await asyncio.sleep(0.025)
+
+    for i, det in enumerate(detections):
+        yield {"event": "det_result", "data": {
+            "page_num": page_num, "det_index": i,
+            "detection": det, "html": ocr_parser.generate_det_html(det, i),
+            "total_detections": len(detections),
+        }}
+    yield {"event": "page_done", "data": {
+        "page_num": page_num, "html": html, "markdown": markdown,
+        "source": "hybrid", "truncated": truncated, "warnings": warnings,
+    }}
+    yield {"event": "page_image", "data": {
+        "page_num": page_num, "image_url": f"/api/page-image/{session.session_id}/{page_num}",
+    }}
 
 
 async def _stream_vlm_page(session, page_num, control, max_length, engine,
@@ -400,7 +449,7 @@ async def process_page(
             status["state"] = "cancelled"
             return
         result = session.page_results.get(page_num) or {}
-        status["state"] = "warning" if result.get("truncated") else "done"
+        status["state"] = "warning" if (result.get("truncated") or result.get("warnings")) else "done"
         result["status"] = status["state"]
     except Exception as exc:
         status["state"] = "failed"

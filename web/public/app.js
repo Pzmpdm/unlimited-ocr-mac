@@ -391,6 +391,7 @@ function handleSSEChunk(chunk) {
         html: data.html,
         markdown: data.markdown,
         truncated: Boolean(data.truncated),
+        warnings: data.warnings || [],
         error: null,
       };
       if (!state.scanStopped && data.page_num === state.currentPage) {
@@ -398,7 +399,8 @@ function handleSSEChunk(chunk) {
         else renderOCRContent(data.html);
         updatePageWarning();
       }
-      setPageStatus(data.page_num, data.truncated ? 'warning' : 'done');
+      const pageWarned = Boolean(data.truncated || (data.warnings && data.warnings.length));
+      setPageStatus(data.page_num, pageWarned ? 'warning' : 'done');
       updateResultStats(data.page_num);
       break;
 
@@ -1061,14 +1063,21 @@ function setPageStatus(page, status) {
     : status === 'scanning' ? '正在识别…' : '等待识别';
 }
 
-// Persistent truncation warning banner that follows the page result.
+// Persistent warning banner that follows the page result (truncation or
+// degraded hybrid regions).
 function updatePageWarning() {
   const warning = $('page-warning');
   if (!warning) return;
   const result = state.pageResults[state.currentPage];
-  const show = Boolean(result && result.truncated);
+  const truncated = Boolean(result && result.truncated);
+  const warnings = (result && result.warnings) || [];
+  const show = truncated || warnings.length > 0;
   warning.classList.toggle('hidden', !show);
-  if (show) $('page-warning-text').textContent = '⚠ 本页达到 OCR 最大生成长度，结果可能不完整';
+  if (show) {
+    $('page-warning-text').textContent = truncated
+      ? '⚠ 本页达到 OCR 最大生成长度，结果可能不完整'
+      : '⚠ 本页部分区域识别降级为原生文本';
+  }
 }
 
 // Page-level failure card with a retry button (Issue 3).
