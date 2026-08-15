@@ -40,7 +40,25 @@
 
 ### 🚀 安装
 
-#### 路径 A：MLX 后端（推荐，Web UI 默认）
+#### 一键安装（推荐）
+
+```bash
+git clone https://github.com/Pzmpdm/unlimited-ocr-mac.git
+cd unlimited-ocr-mac
+bash install.sh            # 一键安装 MLX 后端（默认，推荐）
+bash install.sh --pytorch  # 如需 PyTorch/MPS 后端
+bash install.sh --start    # 安装完成后自动启动 Web UI
+```
+
+安装完成后启动：
+
+```bash
+bash web/scripts/start_web.sh   # 打开 http://localhost:8800
+```
+
+> 💡 一键脚本会自动创建虚拟环境、安装依赖、下载模型（MXFP8 ~3.6 GB + 原始 tokenizer），已存在的内容自动跳过，可放心重复执行。
+
+#### 路径 A：MLX 后端（手动，供参考）
 
 ```bash
 git clone https://github.com/Pzmpdm/unlimited-ocr-mac.git
@@ -210,6 +228,7 @@ unlimited-ocr-mac/
 │   │   └── start_web.sh         # Web UI 一键启动（MLX 默认）
 │   ├── .env.example             # 翻译 API 配置模板
 │   └── requirements.txt         # Python 依赖
+├── install.sh            # 一键安装脚本（MLX 默认 / --pytorch）
 ├── run_mac.py            # Mac 适配核心（应用 patch + 推理）
 └── README.md
 ```
@@ -368,7 +387,23 @@ Run [baidu/Unlimited-OCR](https://github.com/baidu/Unlimited-OCR) (6.7B VLM) **l
 
 ### 🚀 Install
 
-**Path A — MLX backend (recommended, default for Web UI)**
+**One-click install (recommended)**:
+
+```bash
+git clone https://github.com/Pzmpdm/unlimited-ocr-mac.git
+cd unlimited-ocr-mac
+bash install.sh            # MLX backend (default, recommended)
+bash install.sh --pytorch  # or the PyTorch/MPS backend
+bash install.sh --start    # auto-start the Web UI after install
+```
+
+Then start:
+
+```bash
+bash web/scripts/start_web.sh   # open http://localhost:8800
+```
+
+**Path A — MLX backend (manual, for reference)**
 
 ```bash
 git clone https://github.com/Pzmpdm/unlimited-ocr-mac.git
@@ -460,6 +495,7 @@ unlimited-ocr-mac/
 │   ├── docx_exporter.py  #   Word export
 │   ├── public/           #   frontend (index.html / style.css / app.js)
 │   └── scripts/          #   install_web.sh / start_web.sh
+├── install.sh            # one-click installer (MLX default / --pytorch)
 ├── run_mac.py            # Mac adaptation core (apply patches + inference)
 └── README.md
 ```
