@@ -4,36 +4,119 @@ from urllib.parse import quote
 from typing import Optional
 
 
+DET_OPEN = "<|det|>"
+DET_CLOSE = "<|/det|>"
+
+
+def _iter_detection_records(raw: str):
+    """Iterate over well-formed <|det|>TYPE [bbox]<|/det|>CONTENT records.
+
+    A single record may span any number of lines: the content runs from the
+    closing tag up to the next opening tag (or EOF). Bare text between records
+    is yielded as (None, text) so callers can keep it as fallback text.
+    A truncated record (opening tag without a closing tag) is dropped entirely
+    so a mid-stream cut cannot crash the page parser.
+    """
+    i = 0
+    n = len(raw)
+    while True:
+        open_idx = raw.find(DET_OPEN, i)
+        if open_idx == -1:
+            tail = raw[i:].strip()
+            if tail:
+                yield None, tail
+            return
+        if open_idx > i:
+            before = raw[i:open_idx].strip()
+            if before:
+                yield None, before
+        meta_start = open_idx + len(DET_OPEN)
+        close_idx = raw.find(DET_CLOSE, meta_start)
+        if close_idx == -1:
+            # Truncated record: drop it (model artifact), stop scanning.
+            return
+        metadata = raw[meta_start:close_idx]
+        content_start = close_idx + len(DET_CLOSE)
+        next_open = raw.find(DET_OPEN, content_start)
+        content_end = next_open if next_open != -1 else len(raw)
+        content = raw[content_start:content_end].rstrip()
+        # A blank line ends the detection: what follows is bare page text that
+        # must stay out of the detection (e.g. "hello\n\ntrailing text").
+        blank = content.find("\n\n")
+        if blank != -1:
+            record_content = content[:blank].rstrip()
+            tail = content[blank + 2:].strip()
+            yield metadata, record_content
+            if tail:
+                yield None, tail
+        else:
+            yield metadata, content
+        if next_open == -1:
+            return
+        i = next_open
+
+
+def _parse_detection_metadata(metadata: str) -> tuple[str, list[int]]:
+    """Parse '<type> [x1, y1, x2, y2]' into (type, bbox).
+
+    The type is everything before the '[' (so hyphenated names such as
+    display-formula parse cleanly); a malformed or absent bbox yields [].
+    """
+    metadata = metadata.strip()
+    if not metadata:
+        return "text", []
+    bracket = metadata.find("[")
+    if bracket == -1:
+        return metadata, []
+    det_type = metadata[:bracket].strip() or "text"
+    end_bracket = metadata.find("]", bracket)
+    bbox_str = metadata[bracket + 1 : end_bracket] if end_bracket != -1 else ""
+    values = [v.strip() for v in re.split(r"[,;\s]+", bbox_str) if v.strip()]
+    return det_type, normalize_bbox(values)
+
+
+def normalize_bbox(values) -> list[int]:
+    """Validate a 4-number 0..1000 bbox with x1<x2 and y1<y2.
+
+    Returns [] for anything malformed so a single bad detection never aborts
+    the whole page parse.
+    """
+    if not isinstance(values, (list, tuple)) or len(values) != 4:
+        return []
+    try:
+        nums = [int(float(v)) for v in values]
+    except (TypeError, ValueError):
+        return []
+    x1, y1, x2, y2 = nums
+    if not all(0 <= v <= 1000 for v in nums):
+        return []
+    if x1 >= x2 or y1 >= y2:
+        return []
+    return nums
+
+
 def parse_ocr_output(raw: str) -> list[dict]:
-    """Parse <|det|>type [bbox]<|/det|>text into structured list."""
+    """Parse <|det|>type [bbox]<|/det|>text records into structured detections.
+
+    One detection may contain arbitrary newlines (tables, formulas, wrapped
+    text). Non-artifact bare text between records is preserved as a type=text
+    fallback, without duplicating any detection content.
+    """
     if not raw:
         return []
 
     detections = []
-    pattern = re.compile(r"<\|det\|>(\w+)\s*\[([^\]]*)\]<\|/det\|>(.+)")
-    for line in raw.strip().split("\n"):
-        line = line.strip()
-        if not line:
+    for metadata, content in _iter_detection_records(raw):
+        if metadata is None:
+            text = content.strip()
+            if text and not _is_model_artifact(text):
+                detections.append({"type": "text", "bbox": [], "text": text})
             continue
-        if _is_model_artifact(line):
+        det_type, bbox = _parse_detection_metadata(metadata)
+        text = content.strip()
+        if not text:
             continue
-        m = pattern.match(line)
-        if m:
-            det_type = m.group(1)
-            bbox_str = m.group(2)
-            text = m.group(3).strip()
-            try:
-                bbox = [int(x.strip()) for x in bbox_str.split(",") if x.strip()]
-            except ValueError:
-                # A truncated/looping model response must not abort the entire
-                # scan merely because one grounding coordinate is malformed.
-                bbox = []
-            detections.append({"type": det_type, "bbox": bbox, "text": text})
-        else:
-            # Fallback: treat whole line as text
-            if line and not line.startswith("<|") :
-                detections.append({"type": "text", "bbox": [], "text": line})
-
+        detections.append({"type": det_type, "bbox": bbox, "text": text})
     return detections
 
 
@@ -79,7 +162,7 @@ def _is_model_artifact(line: str) -> bool:
     if "<|det|>" in stripped and "<|/det|>" not in stripped:
         return True
     return bool(re.fullmatch(
-        r"(?:text|title|image|figure|chart|diagram|table|formula|page_number)\s*\[[\d\s,.-]*\]",
+        r"[a-z][\w-]*\s*\[[\d\s,.-]*\]",
         stripped,
         flags=re.IGNORECASE,
     ))
@@ -250,7 +333,7 @@ def raw_to_markdown(raw: str, session_id: str = "", page_num: int = 1) -> str:
     if not raw:
         return ""
 
-    pattern = re.compile(r"<\|det\|>(\w+)\s*\[([^\]]*)\]<\|/det\|>")
+    pattern = re.compile(r"<\|det\|>([^\s\[\]]+)\s*\[([^\]]*)\]<\|/det\|>")
 
     def replace_detection(match: re.Match) -> str:
         det_type = match.group(1).lower()
@@ -260,7 +343,7 @@ def raw_to_markdown(raw: str, session_id: str = "", page_num: int = 1) -> str:
             return f"\n\n![图表或图片区域]({url})\n\n"
         if det_type == "title":
             return "\n\n## "
-        if det_type in {"table", "formula"}:
+        if det_type in {"table", "formula", "display-formula", "figure_caption"}:
             return "\n\n"
         return ""
 
@@ -271,7 +354,7 @@ def raw_to_markdown(raw: str, session_id: str = "", page_num: int = 1) -> str:
     markdown = re.sub(r"(?im)^\s*\[non[-_ ]?text\]\s*$", "", markdown)
     markdown = re.sub(r"(?im)^\s*<\|det\|>[^\n]*(?:<\|/det\|>)?\s*$", "", markdown)
     markdown = re.sub(
-        r"(?im)^\s*(?:text|title|image|figure|chart|diagram|table|formula|page_number)\s*\[[\d\s,.-]*\]\s*$",
+        r"(?im)^\s*[a-z][\w-]*\s*\[[\d\s,.-]*\]\s*$",
         "",
         markdown,
     )
